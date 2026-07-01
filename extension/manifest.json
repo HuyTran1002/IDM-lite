@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "IDM Lite Integration Module",
+  "version": "1.0.2",
+  "description": "Chuyển tiếp mọi lượt tải xuống sang IDM Lite (Developed by HuyTran1002)",
+  "permissions": [
+    "downloads",
+    "downloads.shelf",
+    "cookies"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:9091/*",
+    "http://localhost:9091/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

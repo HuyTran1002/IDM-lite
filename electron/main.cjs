@@ -435,20 +435,27 @@ function sanitizeFilename(filename) {
  * `folder/name (1).ext`, `folder/name (2).ext`, etc.
  */
 function resolveUniqueFilePath(folder, name) {
+  let targetFolder = folder;
   try {
-    if (!fs.existsSync(folder)) {
-      fs.mkdirSync(folder, { recursive: true });
+    if (!fs.existsSync(targetFolder)) {
+      fs.mkdirSync(targetFolder, { recursive: true });
     }
   } catch (e) {
-    console.error('Failed to create folder in resolveUniqueFilePath:', e);
+    console.error('Failed to create folder in resolveUniqueFilePath, attempting fallback:', e);
+    try {
+      targetFolder = app.getPath('downloads');
+      if (!fs.existsSync(targetFolder)) {
+        fs.mkdirSync(targetFolder, { recursive: true });
+      }
+    } catch (err) {}
   }
   const ext = path.extname(name);           // e.g. ".zip"
   const base = path.basename(name, ext);    // e.g. "setup"
-  let candidate = path.join(folder, name);
+  let candidate = path.join(targetFolder, name);
   let counter = 1;
   try {
     while (fs.existsSync(candidate)) {
-      candidate = path.join(folder, `${base} (${counter})${ext}`);
+      candidate = path.join(targetFolder, `${base} (${counter})${ext}`);
       counter++;
     }
   } catch (e) {
@@ -648,8 +655,19 @@ class DownloadTask {
         fs.mkdirSync(this.saveFolder, { recursive: true });
       }
     } catch (err) {
-      this.handleError(err);
-      return;
+      console.warn(`Save directory ${this.saveFolder} is inaccessible. Falling back to system Downloads folder.`);
+      try {
+        const fallbackFolder = app.getPath('downloads');
+        if (!fs.existsSync(fallbackFolder)) {
+          fs.mkdirSync(fallbackFolder, { recursive: true });
+        }
+        this.saveFolder = fallbackFolder;
+        this.filePath = resolveUniqueFilePath(this.saveFolder, this.fileName);
+        this.fileName = path.basename(this.filePath);
+      } catch (fallbackErr) {
+        this.handleError(err);
+        return;
+      }
     }
 
     this.status = 'downloading';

@@ -95,7 +95,7 @@ let isInterceptionEnabled = true;
 let interceptedExtensions = ['zip', 'rar', '7z', 'exe', 'msi', 'dmg', 'pkg', 'deb', 'sh', 'apk', 'iso', 'bin', 'tar', 'gz', 'bz2', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'mp4', 'mkv', 'avi', 'mov', 'wmv', 'mp3', 'wav', 'flac', 'm4a'];
 let startWithWindows = false; // Persisted to config.json; used to reliably track startup state
 
-let extensionVersion = '1.0.4'; // Fallback
+let extensionVersion = '1.0.5'; // Fallback
 let lastSeenExtensionVersion = '';
 
 function loadExtensionVersion() {
@@ -200,8 +200,8 @@ function createWindow() {
     }
     // Check for updates 5s after window is ready (non-blocking)
     setTimeout(checkForUpdates, 5000);
-    // Re-check every 6 hours while app is running
-    setInterval(checkForUpdates, 6 * 60 * 60 * 1000);
+    // Re-check every 30 minutes while app is running
+    setInterval(checkForUpdates, 30 * 60 * 1000);
   });
 
   mainWindow.setMenuBarVisibility(false);
@@ -1503,6 +1503,12 @@ ipcMain.handle('save-app-config', (event, newConfig) => {
 // Open GitHub release page in the system browser
 ipcMain.on('open-release-url', (event, url) => {
   shell.openExternal(url || GITHUB_RELEASES_URL);
+});
+
+// Manual update check triggered by user from UI
+ipcMain.handle('check-for-updates', async () => {
+  await checkForUpdates();
+  return { success: true };
 });
 
 ipcMain.on('open-extension-folder', () => {

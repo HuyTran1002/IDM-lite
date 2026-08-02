@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('update-available', subscription);
   },
   openReleaseUrl: (url) => ipcRenderer.send('open-release-url', url),
+  checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
   getVersion: () => ipcRenderer.invoke('get-version'),
   getExtensionStatus: () => ipcRenderer.invoke('get-extension-status'),
   onExtensionStatusUpdate: (callback) => {

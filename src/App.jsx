@@ -245,12 +245,13 @@ function App() {
   const [isInterceptionEnabled, setIsInterceptionEnabled] = useState(true);
   const [startWithWindows, setStartWithWindows] = useState(false);
   const [extensionsString, setExtensionsString] = useState('');
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
 
   // Update notification state
   const [updateInfo, setUpdateInfo] = useState(null);
-  const [appVersion, setAppVersion] = useState('1.0.4');
+  const [appVersion, setAppVersion] = useState('1.0.5');
   const [extensionStatus, setExtensionStatus] = useState({
-    bundledVersion: '1.0.4',
+    bundledVersion: '1.0.5',
     installedVersion: 'Chưa nhận diện',
     needsUpdate: false
   });
@@ -542,6 +543,14 @@ function App() {
       });
     }
     setIsSettingsOpen(false);
+  };
+
+  const handleCheckForUpdates = async () => {
+    if (!isDesktop || !window.api.checkForUpdates) return;
+    setIsCheckingUpdate(true);
+    await window.api.checkForUpdates();
+    // Give time for the update-available event to come back if there is one
+    setTimeout(() => setIsCheckingUpdate(false), 3000);
   };
 
   const handleOpenFolder = (item) => {
@@ -1438,6 +1447,43 @@ function App() {
                         </span>
                       </div>
                     </>
+                  )}
+
+                  {/* Check for Updates */}
+                  {isDesktop && (
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '12px 14px',
+                      background: 'rgba(255,255,255,0.02)',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '8px',
+                    }}>
+                      <div>
+                        <div style={{ fontSize: '13px', fontWeight: '600', color: '#fff' }}>Kiểm tra cập nhật</div>
+                        <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                          Phiên bản hiện tại: <span style={{ color: 'var(--idm-green)', fontWeight: '700' }}>v{appVersion}</span>
+                        </div>
+                      </div>
+                      <button
+                        className="btn btn-secondary"
+                        style={{
+                          fontSize: '12px',
+                          padding: '6px 14px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          opacity: isCheckingUpdate ? 0.6 : 1,
+                          cursor: isCheckingUpdate ? 'not-allowed' : 'pointer',
+                          transition: 'all 0.2s'
+                        }}
+                        onClick={handleCheckForUpdates}
+                        disabled={isCheckingUpdate}
+                      >
+                        {isCheckingUpdate ? '⏳ Đang kiểm tra...' : '🔄 Kiểm tra ngay'}
+                      </button>
+                    </div>
                   )}
                 </div>
               ) : (

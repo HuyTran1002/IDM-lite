@@ -248,9 +248,9 @@ function App() {
 
   // Update notification state
   const [updateInfo, setUpdateInfo] = useState(null);
-  const [appVersion, setAppVersion] = useState('1.0.2');
+  const [appVersion, setAppVersion] = useState('1.0.4');
   const [extensionStatus, setExtensionStatus] = useState({
-    bundledVersion: '1.0.2',
+    bundledVersion: '1.0.4',
     installedVersion: 'Chưa nhận diện',
     needsUpdate: false
   });

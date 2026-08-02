@@ -23,6 +23,17 @@ app.on('second-instance', () => {
 });
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Global Error Safety ──────────────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+  console.error('[Main Process] Uncaught Exception caught:', err.stack || err.message || err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Main Process] Unhandled Rejection caught:', reason);
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 128, keepAliveMsecs: 10000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 128, keepAliveMsecs: 10000 });
 
@@ -84,7 +95,7 @@ let isInterceptionEnabled = true;
 let interceptedExtensions = ['zip', 'rar', '7z', 'exe', 'msi', 'dmg', 'pkg', 'deb', 'sh', 'apk', 'iso', 'bin', 'tar', 'gz', 'bz2', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'mp4', 'mkv', 'avi', 'mov', 'wmv', 'mp3', 'wav', 'flac', 'm4a'];
 let startWithWindows = false; // Persisted to config.json; used to reliably track startup state
 
-let extensionVersion = '1.0.2'; // Fallback
+let extensionVersion = '1.0.4'; // Fallback
 let lastSeenExtensionVersion = '';
 
 function loadExtensionVersion() {
@@ -424,13 +435,24 @@ function sanitizeFilename(filename) {
  * `folder/name (1).ext`, `folder/name (2).ext`, etc.
  */
 function resolveUniqueFilePath(folder, name) {
+  try {
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder, { recursive: true });
+    }
+  } catch (e) {
+    console.error('Failed to create folder in resolveUniqueFilePath:', e);
+  }
   const ext = path.extname(name);           // e.g. ".zip"
   const base = path.basename(name, ext);    // e.g. "setup"
   let candidate = path.join(folder, name);
   let counter = 1;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(folder, `${base} (${counter})${ext}`);
-    counter++;
+  try {
+    while (fs.existsSync(candidate)) {
+      candidate = path.join(folder, `${base} (${counter})${ext}`);
+      counter++;
+    }
+  } catch (e) {
+    console.error('Error checking file existence in resolveUniqueFilePath:', e);
   }
   return candidate;
 }
@@ -621,8 +643,13 @@ class DownloadTask {
   }
 
   start() {
-    if (!fs.existsSync(this.saveFolder)) {
-      fs.mkdirSync(this.saveFolder, { recursive: true });
+    try {
+      if (!fs.existsSync(this.saveFolder)) {
+        fs.mkdirSync(this.saveFolder, { recursive: true });
+      }
+    } catch (err) {
+      this.handleError(err);
+      return;
     }
 
     this.status = 'downloading';
@@ -733,6 +760,10 @@ class DownloadTask {
         this.fileStream = fs.createWriteStream(this.filePath, { 
           flags: 'w',
           highWaterMark: 1024 * 1024 // 1MB buffer
+        });
+
+        this.fileStream.on('error', (err) => {
+          this.handleError(err);
         });
 
         res.on('data', (chunk) => {
@@ -950,6 +981,10 @@ class DownloadTask {
           highWaterMark: 1024 * 1024 // 1MB buffer size for fast writing
         });
 
+        this.fileStream.on('error', (err) => {
+          this.handleError(err);
+        });
+
         res.on('data', (chunk) => {
           this.downloaded += chunk.length;
           const canContinue = this.fileStream.write(chunk);
@@ -1110,6 +1145,9 @@ class DownloadTask {
           flags: seg.downloaded > 0 ? 'a' : 'w',
           highWaterMark: 1024 * 1024 // 1MB buffer
         });
+        stream.on('error', (err) => {
+          this.handleError(err);
+        });
         this.segmentStreams.push(stream);
 
         res.on('data', (chunk) => {
@@ -1167,6 +1205,9 @@ class DownloadTask {
 
     try {
       const writeStream = fs.createWriteStream(this.filePath);
+      writeStream.on('error', (err) => {
+        this.handleError(err);
+      });
 
       for (const seg of this.segments) {
         if (!fs.existsSync(seg.tempPath)) continue;
@@ -1363,12 +1404,15 @@ ipcMain.on('cancel-download', (event, id) => {
 
 ipcMain.on('open-folder', (event, folderPath) => {
   console.log(`Opening folder: ${folderPath}`);
-  if (fs.existsSync(folderPath)) {
+  try {
+    if (!fs.existsSync(folderPath)) {
+      fs.mkdirSync(folderPath, { recursive: true });
+    }
     shell.openPath(folderPath).catch((err) => {
       console.error('Failed to open path:', err);
     });
-  } else {
-    console.warn('Folder does not exist:', folderPath);
+  } catch (err) {
+    console.error('Failed to process open-folder:', err);
   }
 });
 

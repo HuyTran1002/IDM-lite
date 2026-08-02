@@ -383,14 +383,16 @@ function parseContentDisposition(headerValue) {
   const filenameMatch = headerValue.match(/filename=["']?([^"';\n]+)["']?/i);
   if (filenameMatch && filenameMatch[1]) {
     let name = filenameMatch[1].replace(/['"]/g, '');
-    try {
-      // Node.js HTTP parser decodes headers as Latin1. Re-encode and decode as UTF-8.
-      const buf = Buffer.from(name, 'latin1');
-      const utf8Name = buf.toString('utf8');
-      if (utf8Name !== name && !utf8Name.includes('\uFFFD')) {
-        name = utf8Name;
-      }
-    } catch (e) {}
+    if (/^[\u0000-\u00FF]+$/.test(name)) {
+      try {
+        // Node.js HTTP parser decodes headers as Latin1. Re-encode and decode as UTF-8 only if safe.
+        const buf = Buffer.from(name, 'latin1');
+        const utf8Name = buf.toString('utf8');
+        if (utf8Name !== name && !utf8Name.includes('\uFFFD') && !/[\x00-\x1F\x7F]/.test(utf8Name)) {
+          name = utf8Name;
+        }
+      } catch (e) {}
+    }
     try {
       return decodeURIComponent(name);
     } catch (e) {
@@ -403,15 +405,17 @@ function parseContentDisposition(headerValue) {
 function sanitizeFilename(filename) {
   if (!filename) return filename;
   
-  // Convert Latin1 (ISO-8859-1) representation of UTF-8 back to proper UTF-8 if detected.
-  // This handles files whose names were corrupted by Latin1 decoding of UTF-8 bytes (e.g. "HÆ°á»›ng dáº«n")
-  try {
-    const buf = Buffer.from(filename, 'latin1');
-    const utf8Str = buf.toString('utf8');
-    if (utf8Str !== filename && !utf8Str.includes('\uFFFD')) {
-      filename = utf8Str;
-    }
-  } catch (e) {}
+  // Convert Latin1 (ISO-8859-1) representation of UTF-8 back to proper UTF-8 ONLY if all characters
+  // are within Latin-1 range (0x00-0xFF). This prevents corrupting already-valid Unicode strings (like Vietnamese).
+  if (/^[\u0000-\u00FF]+$/.test(filename)) {
+    try {
+      const buf = Buffer.from(filename, 'latin1');
+      const utf8Str = buf.toString('utf8');
+      if (utf8Str !== filename && !utf8Str.includes('\uFFFD') && !/[\x00-\x1F\x7F]/.test(utf8Str)) {
+        filename = utf8Str;
+      }
+    } catch (e) {}
+  }
 
   // 1. Decode RFC 2047 MIME words
   let decoded = decodeMimeWords(filename);
@@ -424,7 +428,10 @@ function sanitizeFilename(filename) {
   // 3. Remove Windows forbidden characters: \ / : * ? " < > |
   decoded = decoded.replace(/[\\/:*?"<>|]/g, '_');
   
-  // Remove multiple spaces/underscores
+  // 4. Remove ASCII control characters (0x00 - 0x1F and 0x7F) that cause Windows CreateFileW ENOENT failures
+  decoded = decoded.replace(/[\x00-\x1F\x7F]/g, '');
+
+  // 5. Remove multiple spaces/underscores
   decoded = decoded.replace(/\s+/g, ' ').trim();
   
   return decoded;

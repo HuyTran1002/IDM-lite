@@ -1,7 +1,7 @@
 {
   "name": "idmlite",
   "private": true,
-  "version": "1.0.5",
+  "version": "1.0.6",
   "type": "module",
   "main": "electron/main.cjs",
   "description": "Internet Download Manager Lite - High-speed multi-threaded download manager (Developed by HuyTran1002)",

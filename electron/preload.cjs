@@ -2,9 +2,16 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
   isElectron: true,
-  startDownload: (id, url, saveFolder, fileName, cookies, referrer) => ipcRenderer.send('start-download', { id, url, saveFolder, fileName, cookies, referrer }),
+  startDownload: (id, url, saveFolder, fileName, cookies, referrer, userAgent) => ipcRenderer.send('start-download', { id, url, saveFolder, fileName, cookies, referrer, userAgent }),
   pauseDownload: (id) => ipcRenderer.send('pause-download', id),
   resumeDownload: (id) => ipcRenderer.send('resume-download', id),
+  onDownloadNeedsRestart: (callback) => {
+    const subscription = (event, value) => callback(event, value);
+    ipcRenderer.on('download-needs-restart', subscription);
+    return () => {
+      ipcRenderer.removeListener('download-needs-restart', subscription);
+    };
+  },
   cancelDownload: (id) => ipcRenderer.send('cancel-download', id),
   openFolder: (folderPath) => ipcRenderer.send('open-folder', folderPath),
   confirmPromptDownload: (data) => ipcRenderer.send('confirm-prompt-download', data),

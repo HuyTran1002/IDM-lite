@@ -190,13 +190,14 @@ function App() {
           url: searchParams.get('url') || '',
           fileName: searchParams.get('fileName') || '',
           cookies: searchParams.get('cookies') || '',
-          referrer: searchParams.get('referrer') || ''
+          referrer: searchParams.get('referrer') || '',
+          userAgent: searchParams.get('userAgent') || ''
         };
       }
     } catch (e) {
       console.error('Error parsing prompt parameters from hash', e);
     }
-    return { url: '', fileName: '', cookies: '', referrer: '' };
+    return { url: '', fileName: '', cookies: '', referrer: '', userAgent: '' };
   };
 
   const initialParams = getPromptParams();
@@ -206,6 +207,7 @@ function App() {
   const [promptName, setPromptName] = useState(initialParams.fileName);
   const [promptCookies, setPromptCookies] = useState(initialParams.cookies);
   const [promptReferrer, setPromptReferrer] = useState(initialParams.referrer);
+  const [promptUserAgent, setPromptUserAgent] = useState(initialParams.userAgent || '');
   const [promptSavePath, setPromptSavePath] = useState(() => {
     return localStorage.getItem('idm_default_save_path') || 'C:\\Downloads';
   });
@@ -249,9 +251,9 @@ function App() {
 
   // Update notification state
   const [updateInfo, setUpdateInfo] = useState(null);
-  const [appVersion, setAppVersion] = useState('1.0.5');
+  const [appVersion, setAppVersion] = useState('1.0.6');
   const [extensionStatus, setExtensionStatus] = useState({
-    bundledVersion: '1.0.5',
+    bundledVersion: '1.0.6',
     installedVersion: 'Chưa nhận diện',
     needsUpdate: false
   });
@@ -376,6 +378,7 @@ function App() {
         const url = data.url;
         const cookies = data.cookies || '';
         const referrer = data.referrer || '';
+        const userAgent = data.userAgent || '';
 
         // Create item and start downloading immediately without opening another modal
         const newItem = {
@@ -390,18 +393,32 @@ function App() {
           savePath: saveFolder,
           addedAt: Date.now(),
           cookies,
-          referrer
+          referrer,
+          userAgent
         };
 
         setDownloads((prev) => [newItem, ...prev]);
 
         if (window.api.startDownload) {
-          window.api.startDownload(newItem.id, newItem.url, saveFolder, name, cookies, referrer);
+          window.api.startDownload(newItem.id, newItem.url, saveFolder, name, cookies, referrer, userAgent);
         }
       });
       return () => unsubscribe();
     }
   }, [isDesktop, isPromptMode, defaultSavePath]);
+
+  // LISTEN FOR DOWNLOAD RESTART REQUEST FROM MAIN PROCESS
+  useEffect(() => {
+    if (isDesktop && window.api.onDownloadNeedsRestart) {
+      const unsubscribe = window.api.onDownloadNeedsRestart((event, id) => {
+        const item = downloads.find((d) => d.id === id);
+        if (item && window.api.startDownload) {
+          window.api.startDownload(item.id, item.url, item.savePath, item.name, item.cookies, item.referrer, item.userAgent);
+        }
+      });
+      return () => unsubscribe();
+    }
+  }, [isDesktop, downloads]);
 
   // LISTEN FOR PROMPT WINDOW INITIALIZATION DATA
   useEffect(() => {
@@ -411,6 +428,7 @@ function App() {
         setPromptName(data.fileName);
         setPromptCookies(data.cookies || '');
         setPromptReferrer(data.referrer || '');
+        setPromptUserAgent(data.userAgent || '');
       });
       return () => unsubscribe();
     }
@@ -523,7 +541,8 @@ function App() {
         name: promptName,
         savePath: promptSavePath,
         cookies: promptCookies,
-        referrer: promptReferrer
+        referrer: promptReferrer,
+        userAgent: promptUserAgent
       });
     }
   };
@@ -575,9 +594,13 @@ function App() {
     const item = downloads.find((d) => d.id === id);
     if (!item) return;
 
-    if (isDesktop && window.api.resumeDownload) {
-      // Use dedicated resume IPC so the existing task resumes from the correct file path
-      window.api.resumeDownload(id);
+    if (isDesktop) {
+      if (item.status === 'failed' && window.api.startDownload) {
+        // If task failed earlier, restart with existing file/temp data
+        window.api.startDownload(item.id, item.url, item.savePath, item.name, item.cookies, item.referrer, item.userAgent);
+      } else if (window.api.resumeDownload) {
+        window.api.resumeDownload(id);
+      }
     } else {
       setDownloads((prev) =>
         prev.map((i) =>

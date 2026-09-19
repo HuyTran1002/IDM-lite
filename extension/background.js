@@ -19,8 +19,11 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
     // Bỏ qua
   }
 
-  // Bỏ qua nếu là liên kết nội bộ loopback
-  if (downloadItem.url.startsWith('http://127.0.0.1') || downloadItem.url.startsWith('http://localhost')) {
+  // Bỏ qua nếu là liên kết nội bộ loopback hoặc URL blob:, data: tạo cục bộ trong trình duyệt
+  if (downloadItem.url.startsWith('http://127.0.0.1') || 
+      downloadItem.url.startsWith('http://localhost') ||
+      downloadItem.url.startsWith('blob:') ||
+      downloadItem.url.startsWith('data:')) {
     suggest();
     return;
   }
@@ -51,7 +54,10 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
         return; // Không can thiệp nếu tắt tính năng bắt link hoặc server báo false
       }
 
-      const url = downloadItem.url;
+      // Ưu tiên finalUrl (URL trực tiếp sau redirect) nếu có, fallback về url gốc
+      const url = (downloadItem.finalUrl && downloadItem.finalUrl.startsWith('http')) 
+        ? downloadItem.finalUrl 
+        : downloadItem.url;
       const filename = downloadItem.filename || '';
       
       // Lấy đuôi file
@@ -121,7 +127,8 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
                 url: url,
                 fileName: filename,
                 cookies: cookieStr,
-                referrer: referrerUrl
+                referrer: referrerUrl,
+                userAgent: navigator.userAgent || ''
               })
             }).catch(e => console.error('Error posting download to IDM Lite:', e));
           };

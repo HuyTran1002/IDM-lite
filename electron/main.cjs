@@ -37,6 +37,36 @@ process.on('unhandledRejection', (reason, promise) => {
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 128, keepAliveMsecs: 10000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 128, keepAliveMsecs: 10000 });
 
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36';
+
+function buildStandardHeaders(options = {}) {
+  const headers = {
+    'User-Agent': options.userAgent || DEFAULT_USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'en-US,en;q=0.9,vi;q=0.8',
+    'Accept-Encoding': 'identity',
+    'Connection': 'keep-alive',
+    'Sec-Ch-Ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': options.range ? 'empty' : 'document',
+    'Sec-Fetch-Mode': options.range ? 'cors' : 'navigate',
+    'Sec-Fetch-Site': 'cross-site',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1'
+  };
+  if (options.range) {
+    headers['Range'] = options.range;
+  }
+  if (options.cookies) {
+    headers['Cookie'] = options.cookies;
+  }
+  if (options.referrer) {
+    headers['Referer'] = options.referrer;
+  }
+  return headers;
+}
+
 // ── Auto-Update via GitHub Releases ──────────────────────────────────────────
 // TODO: Change this to your actual GitHub repo path before publishing
 const GITHUB_REPO = 'HuyTran1002/IDM-lite';
@@ -95,7 +125,7 @@ let isInterceptionEnabled = true;
 let interceptedExtensions = ['zip', 'rar', '7z', 'exe', 'msi', 'dmg', 'pkg', 'deb', 'sh', 'apk', 'iso', 'bin', 'tar', 'gz', 'bz2', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'mp4', 'mkv', 'avi', 'mov', 'wmv', 'mp3', 'wav', 'flac', 'm4a'];
 let startWithWindows = false; // Persisted to config.json; used to reliably track startup state
 
-let extensionVersion = '1.0.5'; // Fallback
+let extensionVersion = '1.0.6'; // Fallback
 let lastSeenExtensionVersion = '';
 
 function loadExtensionVersion() {
@@ -286,7 +316,7 @@ function createTray() {
   });
 }
 
-function openPromptWindow(url, fileName, cookies, referrer) {
+function openPromptWindow(url, fileName, cookies, referrer, userAgent) {
   if (promptWindow) {
     try {
       promptWindow.close();
@@ -309,7 +339,7 @@ function openPromptWindow(url, fileName, cookies, referrer) {
   });
 
   const isDev = process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
-  const queryStr = `?url=${encodeURIComponent(url)}&fileName=${encodeURIComponent(fileName)}&cookies=${encodeURIComponent(cookies || '')}&referrer=${encodeURIComponent(referrer || '')}`;
+  const queryStr = `?url=${encodeURIComponent(url)}&fileName=${encodeURIComponent(fileName)}&cookies=${encodeURIComponent(cookies || '')}&referrer=${encodeURIComponent(referrer || '')}&userAgent=${encodeURIComponent(userAgent || '')}`;
 
   if (isDev) {
     promptWindow.loadURL(`http://localhost:5173/#prompt${queryStr}`);
@@ -319,7 +349,7 @@ function openPromptWindow(url, fileName, cookies, referrer) {
 
   // Send data to the window when ready
   promptWindow.webContents.on('did-finish-load', () => {
-    promptWindow.webContents.send('init-prompt', { url, fileName, cookies: cookies || '', referrer: referrer || '' });
+    promptWindow.webContents.send('init-prompt', { url, fileName, cookies: cookies || '', referrer: referrer || '', userAgent: userAgent || '' });
   });
 
   promptWindow.setMenuBarVisibility(false);
@@ -403,7 +433,7 @@ function parseContentDisposition(headerValue) {
 }
 
 function sanitizeFilename(filename) {
-  if (!filename) return filename;
+  if (!filename) return 'download_' + Date.now();
   
   // Convert Latin1 (ISO-8859-1) representation of UTF-8 back to proper UTF-8 ONLY if all characters
   // are within Latin-1 range (0x00-0xFF). This prevents corrupting already-valid Unicode strings (like Vietnamese).
@@ -433,6 +463,23 @@ function sanitizeFilename(filename) {
 
   // 5. Remove multiple spaces/underscores
   decoded = decoded.replace(/\s+/g, ' ').trim();
+
+  // 6. Strip trailing dots and spaces (Windows denies or strips these, causing ENOENT)
+  decoded = decoded.replace(/[. ]+$/, '');
+
+  // 7. Check Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+  const ext = path.extname(decoded);
+  let base = path.basename(decoded, ext);
+  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(base)) {
+    base = '_' + base;
+  }
+
+  // 8. Prevent MAX_PATH issues on Windows by truncating base filename if too long
+  if (base.length > 150) {
+    base = base.slice(0, 150);
+  }
+
+  decoded = (base || 'download_' + Date.now()) + ext;
   
   return decoded;
 }
@@ -520,7 +567,8 @@ function startHttpServer() {
               const fileName = data.fileName || getFilenameFromUrl(downloadUrl) || 'download_file_' + Math.floor(Math.random() * 1000);
               const cookies = data.cookies || '';
               const referrer = data.referrer || '';
-              openPromptWindow(downloadUrl, fileName, cookies, referrer);
+              const userAgent = data.userAgent || '';
+              openPromptWindow(downloadUrl, fileName, cookies, referrer, userAgent);
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: true, message: 'IDM Lite interceptor popup triggered' }));
             } else {
@@ -536,7 +584,8 @@ function startHttpServer() {
         const downloadUrl = parsedUrl.searchParams.get('url');
         if (downloadUrl) {
           let fileName = parsedUrl.searchParams.get('fileName') || getFilenameFromUrl(downloadUrl) || 'download_file_' + Math.floor(Math.random() * 1000);
-          openPromptWindow(downloadUrl, fileName, '', '');
+          const userAgent = parsedUrl.searchParams.get('userAgent') || '';
+          openPromptWindow(downloadUrl, fileName, '', '', userAgent);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, message: 'IDM Lite interceptor popup triggered' }));
         } else {
@@ -627,7 +676,7 @@ app.on('will-quit', () => {
 const activeDownloads = {};
 
 class DownloadTask {
-  constructor(id, url, saveFolder, fileName, cookies, referrer) {
+  constructor(id, url, saveFolder, fileName, cookies, referrer, userAgent) {
     this.id = id;
     this.url = url;
     this.saveFolder = saveFolder;
@@ -637,6 +686,7 @@ class DownloadTask {
     this.fileName = path.basename(this.filePath);
     this.cookies = cookies || '';
     this.referrer = referrer || '';
+    this.userAgent = userAgent || DEFAULT_USER_AGENT;
     
     this.downloaded = 0;
     this.total = 0;
@@ -685,150 +735,34 @@ class DownloadTask {
     const isSensitiveUrl = this.url.includes('token=') || 
                            this.url.includes('auth=') || 
                            this.url.includes('signature=') ||
+                           this.url.includes('sig=') ||
+                           this.url.includes('Signature=') ||
+                           this.url.includes('tempauth=') ||
+                           this.url.includes('Key-Pair-Id=') ||
+                           this.url.includes('download_token=') ||
+                           this.url.includes('access_token=') ||
                            this.url.includes('g-portal') ||
                            this.url.includes('gmail') ||
-                           this.url.includes('drive.google');
+                           this.url.includes('drive.google') ||
+                           this.url.includes('drive.usercontent.google') ||
+                           this.url.includes('onedrive.live.com') ||
+                           this.url.includes('my.microsoftpersonalcontent.com') ||
+                           this.url.includes('sharepoint.com') ||
+                           this.url.includes('mediafire.com') ||
+                           this.url.includes('fshare.vn') ||
+                           this.url.includes('pixeldrain.com');
 
     if (isSensitiveUrl) {
-      console.log(`Sensitive URL detected (one-time token or auth gateway). Bypassing range check to download directly using single-connection stream.`);
-      this.startDirectSingleConnectionDownload(this.url);
+      console.log(`Sensitive URL detected (one-time token or auth gateway). Bypassing range probe to download directly using single-connection stream.`);
+      this.startSingleConnectionDownload(this.url);
     } else {
       this.getHeadersAndStart(this.url);
     }
   }
 
   startDirectSingleConnectionDownload(targetUrl) {
-    try {
-      const parsedUrl = new URL(targetUrl);
-      const isHttps = parsedUrl.protocol === 'https:';
-      const client = isHttps ? https : http;
-      const agent = isHttps ? httpsAgent : httpAgent;
-
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive'
-      };
-      if (this.cookies) {
-        headers['Cookie'] = this.cookies;
-      }
-      if (this.referrer) {
-        headers['Referer'] = this.referrer;
-      }
-      try {
-        headers['Origin'] = new URL(this.url).origin;
-      } catch (e) {}
-
-      const options = {
-        agent: agent,
-        headers: headers
-      };
-
-      this.request = client.get(targetUrl, options, (res) => {
-        // Handle redirect
-        if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-          let redirectUrl = res.headers.location;
-          if (redirectUrl) {
-            try {
-              redirectUrl = new URL(redirectUrl, targetUrl).href;
-            } catch (e) {
-              console.error('Failed to resolve redirect URL:', e);
-            }
-            console.log(`Redirecting direct download to: ${redirectUrl}`);
-            const nameFromRedirect = getFilenameFromUrl(redirectUrl);
-            if (nameFromRedirect) {
-              const safeRedirectName = sanitizeFilename(nameFromRedirect);
-              this.filePath = resolveUniqueFilePath(this.saveFolder, safeRedirectName);
-              this.fileName = path.basename(this.filePath);
-              this.category = detectCategory(this.fileName);
-            }
-            this.startDirectSingleConnectionDownload(redirectUrl);
-            return;
-          }
-        }
-
-        if (res.statusCode >= 400 && res.statusCode !== 416) {
-          this.handleError(new Error(`Server returned status code: ${res.statusCode}`));
-          return;
-        }
-
-        const contentType = res.headers['content-type'] || '';
-        const isHtmlResponse = contentType.includes('text/html') || contentType.includes('application/xhtml+xml');
-        const ext = this.fileName.split('.').pop().toLowerCase();
-        const nonHtmlExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'exe', 'msi', 'dmg', 'pkg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'mp4', 'mkv', 'mp3', 'bin', 'dll'];
-        
-        if (isHtmlResponse && nonHtmlExtensions.includes(ext)) {
-          this.handleError(new Error('Server trả về trang web (HTML) thay vì file tải xuống. Vui lòng kiểm tra lại quyền đăng nhập hoặc liên kết.'));
-          res.req.destroy();
-          return;
-        }
-
-        this.url = targetUrl; // Save resolved URL
-
-        // Update file name from Content-Disposition if present
-        const contentDisposition = res.headers['content-disposition'];
-        if (contentDisposition) {
-          const parsedName = parseContentDisposition(contentDisposition);
-          if (parsedName) {
-            const safeParsedName = sanitizeFilename(parsedName);
-            this.filePath = resolveUniqueFilePath(this.saveFolder, safeParsedName);
-            this.fileName = path.basename(this.filePath);
-            this.category = detectCategory(this.fileName);
-          }
-        }
-
-        const contentLength = res.headers['content-length'];
-        this.total = contentLength ? parseInt(contentLength, 10) : 0;
-        this.downloaded = 0;
-
-        this.fileStream = fs.createWriteStream(this.filePath, { 
-          flags: 'w',
-          highWaterMark: 1024 * 1024 // 1MB buffer
-        });
-
-        this.fileStream.on('error', (err) => {
-          this.handleError(err);
-        });
-
-        res.on('data', (chunk) => {
-          this.downloaded += chunk.length;
-          const canContinue = this.fileStream.write(chunk);
-          if (!canContinue) {
-            res.pause();
-            this.fileStream.once('drain', () => res.resume());
-          }
-          this.sendProgress();
-        });
-
-        res.on('end', () => {
-          if (this.fileStream) {
-            this.fileStream.end(() => {
-              this.complete();
-            });
-          } else {
-            this.complete();
-          }
-        });
-
-        res.on('error', (err) => {
-          if (this.fileStream) this.fileStream.end();
-          this.handleError(err);
-        });
-      });
-
-      this.request.on('socket', (socket) => {
-        socket.setNoDelay(true);
-        socket.setKeepAlive(true, 10000);
-      });
-
-      this.request.on('error', (err) => {
-        this.handleError(err);
-      });
-
-    } catch (err) {
-      this.handleError(err);
-    }
+    // Backward-compatibility alias
+    this.startSingleConnectionDownload(targetUrl);
   }
 
   getHeadersAndStart(targetUrl) {
@@ -838,27 +772,16 @@ class DownloadTask {
       const client = isHttps ? https : http;
       const agent = isHttps ? httpsAgent : httpAgent;
 
-      // Perform a range request for the first byte to verify server range support with Keep-Alive
       const options = {
         method: 'GET',
         agent: agent,
-        headers: {
-          'Range': 'bytes=0-0',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': '*/*',
-          'Accept-Encoding': 'identity',
-          'Connection': 'keep-alive'
-        }
+        headers: buildStandardHeaders({
+          range: 'bytes=0-0',
+          cookies: this.cookies,
+          referrer: this.referrer,
+          userAgent: this.userAgent
+        })
       };
-      if (this.cookies) {
-        options.headers['Cookie'] = this.cookies;
-      }
-      if (this.referrer) {
-        options.headers['Referer'] = this.referrer;
-      }
-      try {
-        options.headers['Origin'] = new URL(this.url).origin;
-      } catch (e) {}
 
       const req = client.get(targetUrl, options, (res) => {
         if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
@@ -873,7 +796,6 @@ class DownloadTask {
             const nameFromRedirect = getFilenameFromUrl(redirectUrl);
             if (nameFromRedirect) {
               const safeRedirectName = sanitizeFilename(nameFromRedirect);
-              // Re-resolve a unique path in case the redirected name conflicts with an existing file
               this.filePath = resolveUniqueFilePath(this.saveFolder, safeRedirectName);
               this.fileName = path.basename(this.filePath);
               this.category = detectCategory(this.fileName);
@@ -883,6 +805,13 @@ class DownloadTask {
           }
         }
 
+        // Check HTTP status code FIRST before inspecting HTML content
+        if (res.statusCode >= 400 && res.statusCode !== 416) {
+          req.destroy();
+          this.handleError(new Error(`Server trả về mã lỗi HTTP: ${res.statusCode} (${res.statusMessage || 'Lỗi kết nối'})`));
+          return;
+        }
+
         this.url = targetUrl; // Save resolved URL
 
         const contentDisposition = res.headers['content-disposition'];
@@ -890,22 +819,23 @@ class DownloadTask {
           const parsedName = parseContentDisposition(contentDisposition);
           if (parsedName) {
             const safeParsedName = sanitizeFilename(parsedName);
-            // Re-resolve a unique path in case the server-supplied name conflicts
             this.filePath = resolveUniqueFilePath(this.saveFolder, safeParsedName);
             this.fileName = path.basename(this.filePath);
             this.category = detectCategory(this.fileName);
           }
         }
+
         const contentType = res.headers['content-type'] || '';
         const isHtmlResponse = contentType.includes('text/html') || contentType.includes('application/xhtml+xml');
         const ext = this.fileName.split('.').pop().toLowerCase();
-        const nonHtmlExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'exe', 'msi', 'dmg', 'pkg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'mp4', 'mkv', 'mp3', 'bin', 'dll'];
+        const nonHtmlExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'exe', 'msi', 'dmg', 'pkg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'mp4', 'mkv', 'mp3', 'bin', 'dll', 'iso'];
         
         if (isHtmlResponse && nonHtmlExtensions.includes(ext)) {
           this.handleError(new Error('Server trả về trang web (HTML) thay vì file tải xuống. Vui lòng kiểm tra lại quyền đăng nhập hoặc liên kết.'));
           req.destroy();
           return;
         }
+
         const contentRange = res.headers['content-range'];
         this.acceptsRanges = res.statusCode === 206 || contentRange !== undefined;
 
@@ -916,14 +846,16 @@ class DownloadTask {
         }
         if (!totalSize) {
           const contentLength = res.headers['content-length'];
-          totalSize = contentLength ? parseInt(contentLength, 10) : 0;
+          if (res.statusCode === 200) {
+            totalSize = contentLength ? parseInt(contentLength, 10) : 0;
+          }
         }
 
         this.total = totalSize;
         req.destroy(); // Disconnect range verification request
 
         if (this.acceptsRanges && totalSize > 1024 * 1024) {
-          console.log(`Server supports Range requests. Initiating multi-connection download (8 threads) for file of size ${totalSize} bytes.`);
+          console.log(`Server supports Range requests. Initiating multi-connection download for file of size ${totalSize} bytes.`);
           this.startMultiConnectionDownload(targetUrl, totalSize);
         } else {
           console.log(`Server does not support Range requests or file is small. Falling back to single-connection stream.`);
@@ -951,33 +883,19 @@ class DownloadTask {
       const client = isHttps ? https : http;
       const agent = isHttps ? httpsAgent : httpAgent;
 
-      // If the file already exists (i.e. a paused resume), pick up from the already-downloaded bytes.
-      // The filePath is set in the constructor, so it is always the correct unique path.
+      // If the file already exists (i.e. a paused resume), pick up from the already-downloaded bytes
       let localDownloaded = 0;
       if (fs.existsSync(this.filePath)) {
         localDownloaded = fs.statSync(this.filePath).size;
       }
       this.downloaded = localDownloaded;
 
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive'
-      };
-      // Resume from the byte offset we already have
-      if (localDownloaded > 0) {
-        headers['Range'] = `bytes=${localDownloaded}-`;
-      }
-      if (this.cookies) {
-        headers['Cookie'] = this.cookies;
-      }
-      if (this.referrer) {
-        headers['Referer'] = this.referrer;
-      }
-      try {
-        headers['Origin'] = new URL(this.url).origin;
-      } catch (e) {}
+      const headers = buildStandardHeaders({
+        range: localDownloaded > 0 ? `bytes=${localDownloaded}-` : undefined,
+        cookies: this.cookies,
+        referrer: this.referrer,
+        userAgent: this.userAgent
+      });
 
       const options = {
         agent: agent,
@@ -985,15 +903,37 @@ class DownloadTask {
       };
 
       this.request = client.get(targetUrl, options, (res) => {
+        // Handle redirect
+        if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+          let redirectUrl = res.headers.location;
+          if (redirectUrl) {
+            try {
+              redirectUrl = new URL(redirectUrl, targetUrl).href;
+            } catch (e) {
+              console.error('Failed to resolve redirect URL:', e);
+            }
+            console.log(`Redirecting single connection download to: ${redirectUrl}`);
+            const nameFromRedirect = getFilenameFromUrl(redirectUrl);
+            if (nameFromRedirect && localDownloaded === 0) {
+              const safeRedirectName = sanitizeFilename(nameFromRedirect);
+              this.filePath = resolveUniqueFilePath(this.saveFolder, safeRedirectName);
+              this.fileName = path.basename(this.filePath);
+              this.category = detectCategory(this.fileName);
+            }
+            this.startSingleConnectionDownload(redirectUrl);
+            return;
+          }
+        }
+
         if (res.statusCode >= 400 && res.statusCode !== 416) {
-          this.handleError(new Error(`Server returned status code: ${res.statusCode}`));
+          this.handleError(new Error(`Server trả về mã lỗi HTTP: ${res.statusCode} (${res.statusMessage || 'Lỗi tải'})`));
           return;
         }
 
         const contentType = res.headers['content-type'] || '';
         const isHtmlResponse = contentType.includes('text/html') || contentType.includes('application/xhtml+xml');
         const ext = this.fileName.split('.').pop().toLowerCase();
-        const nonHtmlExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'exe', 'msi', 'dmg', 'pkg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'mp4', 'mkv', 'mp3', 'bin', 'dll'];
+        const nonHtmlExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'exe', 'msi', 'dmg', 'pkg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'mp4', 'mkv', 'mp3', 'bin', 'dll', 'iso'];
         
         if (isHtmlResponse && nonHtmlExtensions.includes(ext)) {
           this.handleError(new Error('Server trả về trang web (HTML) thay vì file tải xuống. Vui lòng kiểm tra lại quyền đăng nhập hoặc liên kết.'));
@@ -1001,8 +941,51 @@ class DownloadTask {
           return;
         }
 
+        this.url = targetUrl; // Save resolved URL
+
+        // Update file name from Content-Disposition if present and not yet downloaded
+        if (localDownloaded === 0) {
+          const contentDisposition = res.headers['content-disposition'];
+          if (contentDisposition) {
+            const parsedName = parseContentDisposition(contentDisposition);
+            if (parsedName) {
+              const safeParsedName = sanitizeFilename(parsedName);
+              this.filePath = resolveUniqueFilePath(this.saveFolder, safeParsedName);
+              this.fileName = path.basename(this.filePath);
+              this.category = detectCategory(this.fileName);
+            }
+          }
+        }
+
+        // Parse total file size correctly
+        const contentRange = res.headers['content-range'];
+        let totalSize = 0;
+        if (contentRange) {
+          const match = contentRange.match(/\/(\d+)$/);
+          if (match) totalSize = parseInt(match[1], 10);
+        }
+        if (!totalSize) {
+          const contentLength = res.headers['content-length'];
+          if (contentLength) {
+            totalSize = (res.statusCode === 206 && localDownloaded > 0)
+              ? localDownloaded + parseInt(contentLength, 10)
+              : parseInt(contentLength, 10);
+          }
+        }
+        if (totalSize > 0) {
+          this.total = totalSize;
+        }
+
+        // If server sent 200 OK instead of 206 Partial Content when we requested a Range resume,
+        // it means the server restarted the stream from byte 0. Reset downloaded count.
+        const isAppended = localDownloaded > 0 && res.statusCode === 206;
+        if (localDownloaded > 0 && res.statusCode === 200) {
+          this.downloaded = 0;
+          localDownloaded = 0;
+        }
+
         this.fileStream = fs.createWriteStream(this.filePath, { 
-          flags: localDownloaded > 0 ? 'a' : 'w',
+          flags: isAppended ? 'a' : 'w',
           highWaterMark: 1024 * 1024 // 1MB buffer size for fast writing
         });
 
@@ -1023,6 +1006,17 @@ class DownloadTask {
         res.on('end', () => {
           if (this.fileStream) {
             this.fileStream.end(() => {
+              // Verify if file ended prematurely
+              if (this.total > 0 && this.downloaded < this.total && this.status === 'downloading') {
+                console.warn(`Single-stream connection closed prematurely (${this.downloaded}/${this.total} bytes). Reconnecting to resume...`);
+                this.fileStream = null;
+                setTimeout(() => {
+                  if (this.status === 'downloading') {
+                    this.startSingleConnectionDownload(targetUrl);
+                  }
+                }, 1000);
+                return;
+              }
               this.complete();
             });
           } else {
@@ -1031,6 +1025,19 @@ class DownloadTask {
         });
 
         res.on('error', (err) => {
+          if (this.fileStream) {
+            try { this.fileStream.end(); } catch (e) {}
+            this.fileStream = null;
+          }
+          if (['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(err.code) && this.status === 'downloading') {
+            console.warn(`Single-stream connection error (${err.code}). Reconnecting in 1.5s...`);
+            setTimeout(() => {
+              if (this.status === 'downloading') {
+                this.startSingleConnectionDownload(targetUrl);
+              }
+            }, 1500);
+            return;
+          }
           this.handleError(err);
         });
       });
@@ -1041,6 +1048,15 @@ class DownloadTask {
       });
 
       this.request.on('error', (err) => {
+        if (['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(err.code) && this.status === 'downloading') {
+          console.warn(`Single-stream socket error (${err.code}). Reconnecting in 1.5s...`);
+          setTimeout(() => {
+            if (this.status === 'downloading') {
+              this.startSingleConnectionDownload(targetUrl);
+            }
+          }, 1500);
+          return;
+        }
         this.handleError(err);
       });
 
@@ -1051,14 +1067,11 @@ class DownloadTask {
 
   startMultiConnectionDownload(targetUrl, totalSize) {
     try {
-      // Adaptive threads: >500MB = 32 threads, >100MB = 24 threads, >20MB = 16 threads, else 8 threads
+      // Standard IDM-grade thread count: 4 threads for small files, max 8 threads for larger files.
+      // 8 threads maximizes throughput without triggering CDN socket drops / rate limits.
       let numConnections = 8;
-      if (totalSize > 500 * 1024 * 1024) {
-        numConnections = 32;
-      } else if (totalSize > 100 * 1024 * 1024) {
-        numConnections = 24;
-      } else if (totalSize > 20 * 1024 * 1024) {
-        numConnections = 16;
+      if (totalSize <= 30 * 1024 * 1024) {
+        numConnections = 4;
       }
       
       const chunkSize = Math.ceil(totalSize / numConnections);
@@ -1091,7 +1104,8 @@ class DownloadTask {
           endPos,
           downloaded: segDownloaded,
           tempPath,
-          completed: segDownloaded >= (endPos - startPos + 1)
+          completed: segDownloaded >= (endPos - startPos + 1),
+          retryCount: 0
         });
       }
 
@@ -1126,10 +1140,17 @@ class DownloadTask {
 
   downloadSegment(targetUrl, seg, callback) {
     try {
+      if (this.status !== 'downloading') return;
+
       const parsedUrl = new URL(targetUrl);
       const isHttps = parsedUrl.protocol === 'https:';
       const client = isHttps ? https : http;
       const agent = isHttps ? httpsAgent : httpAgent;
+
+      // Read actual written bytes from disk
+      if (fs.existsSync(seg.tempPath)) {
+        seg.downloaded = fs.statSync(seg.tempPath).size;
+      }
 
       const start = seg.startPos + seg.downloaded;
       const end = seg.endPos;
@@ -1140,29 +1161,60 @@ class DownloadTask {
         return;
       }
 
-      const options = {
-        agent: agent,
-        headers: {
-          'Range': `bytes=${start}-${end}`,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': '*/*',
-          'Accept-Encoding': 'identity',
-          'Connection': 'keep-alive'
+      const MAX_SEGMENT_RETRIES = 5;
+
+      const triggerRetry = (err) => {
+        if (this.status !== 'downloading') return;
+        
+        seg.retryCount = (seg.retryCount || 0) + 1;
+        if (seg.retryCount <= MAX_SEGMENT_RETRIES) {
+          const delay = Math.min(800 * Math.pow(1.5, seg.retryCount - 1), 5000);
+          console.warn(`[Segment ${seg.index}] Reconnecting (${seg.retryCount}/${MAX_SEGMENT_RETRIES}) in ${Math.round(delay)}ms due to: ${err ? (err.message || err) : 'network drop'}`);
+          setTimeout(() => {
+            if (this.status === 'downloading') {
+              this.downloadSegment(targetUrl, seg, callback);
+            }
+          }, delay);
+        } else {
+          console.error(`[Segment ${seg.index}] Failed permanently after ${MAX_SEGMENT_RETRIES} retries.`);
+          this.handleError(new Error(`Segment ${seg.index} mất kết nối liên tục: ${err ? (err.message || err) : 'Lỗi đường truyền'}`));
         }
       };
-      if (this.cookies) {
-        options.headers['Cookie'] = this.cookies;
-      }
-      if (this.referrer) {
-        options.headers['Referer'] = this.referrer;
-      }
-      try {
-        options.headers['Origin'] = new URL(this.url).origin;
-      } catch (e) {}
+
+      const options = {
+        agent: agent,
+        headers: buildStandardHeaders({
+          range: `bytes=${start}-${end}`,
+          cookies: this.cookies,
+          referrer: this.referrer,
+          userAgent: this.userAgent
+        })
+      };
 
       const req = client.get(targetUrl, options, (res) => {
+        // Handle redirect in segment
+        if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+          let redirectUrl = res.headers.location;
+          if (redirectUrl) {
+            try {
+              redirectUrl = new URL(redirectUrl, targetUrl).href;
+            } catch (e) {}
+            this.downloadSegment(redirectUrl, seg, callback);
+            return;
+          }
+        }
+
+        // CRITICAL: If server sends 200 OK for a sub-range (seg.startPos > 0), the server ignores Range
+        // headers and sends the full file! Fallback immediately to single connection to avoid file corruption.
+        if (res.statusCode === 200 && seg.startPos > 0) {
+          console.warn(`[Segment ${seg.index}] Server returned 200 OK instead of 206 Partial Content. Range requests are not supported. Falling back to single-connection stream.`);
+          this.cleanup();
+          this.startSingleConnectionDownload(targetUrl);
+          return;
+        }
+
         if (res.statusCode !== 206 && res.statusCode !== 200) {
-          this.handleError(new Error(`Segment ${seg.index} server returned: ${res.statusCode}`));
+          triggerRetry(new Error(`Server returned status code: ${res.statusCode}`));
           return;
         }
 
@@ -1170,9 +1222,12 @@ class DownloadTask {
           flags: seg.downloaded > 0 ? 'a' : 'w',
           highWaterMark: 1024 * 1024 // 1MB buffer
         });
+
         stream.on('error', (err) => {
-          this.handleError(err);
+          this.segmentStreams = this.segmentStreams.filter(s => s !== stream);
+          triggerRetry(err);
         });
+
         this.segmentStreams.push(stream);
 
         res.on('data', (chunk) => {
@@ -1194,18 +1249,29 @@ class DownloadTask {
 
         res.on('end', () => {
           this.segmentStreams = this.segmentStreams.filter(s => s !== stream);
-          if (seg.downloaded >= (seg.endPos - seg.startPos + 1)) {
-            seg.completed = true;
-          }
           stream.end(() => {
-            callback();
+            // Verify actual bytes on disk
+            let actualBytes = 0;
+            if (fs.existsSync(seg.tempPath)) {
+              actualBytes = fs.statSync(seg.tempPath).size;
+            }
+            const expectedBytes = seg.endPos - seg.startPos + 1;
+            if (actualBytes >= expectedBytes) {
+              seg.downloaded = expectedBytes;
+              seg.completed = true;
+              callback();
+            } else {
+              // Premature stream close (server closed early before sending all bytes)
+              console.warn(`[Segment ${seg.index}] Stream ended early: ${actualBytes}/${expectedBytes} bytes. Triggering retry.`);
+              triggerRetry(new Error(`Stream ended early (${actualBytes}/${expectedBytes} bytes)`));
+            }
           });
         });
 
         res.on('error', (err) => {
-          stream.end();
           this.segmentStreams = this.segmentStreams.filter(s => s !== stream);
-          this.handleError(err);
+          try { stream.end(); } catch (e) {}
+          triggerRetry(err);
         });
       });
 
@@ -1215,7 +1281,7 @@ class DownloadTask {
       });
 
       req.on('error', (err) => {
-        this.handleError(err);
+        triggerRetry(err);
       });
 
       this.segmentRequests.push(req);
@@ -1228,35 +1294,45 @@ class DownloadTask {
     this.status = 'merging';
     this.sendProgress(true);
 
-    try {
-      const writeStream = fs.createWriteStream(this.filePath);
-      writeStream.on('error', (err) => {
-        this.handleError(err);
-      });
+    let attempts = 0;
+    const maxAttempts = 5;
+    let writeSuccess = false;
 
-      for (const seg of this.segments) {
-        if (!fs.existsSync(seg.tempPath)) continue;
+    while (attempts < maxAttempts && !writeSuccess) {
+      attempts++;
+      try {
+        const writeStream = fs.createWriteStream(this.filePath);
         await new Promise((resolve, reject) => {
-          const readStream = fs.createReadStream(seg.tempPath, { highWaterMark: 4 * 1024 * 1024 });
-          readStream.on('data', (chunk) => {
-            const canContinue = writeStream.write(chunk);
-            if (!canContinue) {
-              readStream.pause();
-              writeStream.once('drain', () => readStream.resume());
+          writeStream.on('error', reject);
+          (async () => {
+            for (const seg of this.segments) {
+              if (!fs.existsSync(seg.tempPath)) continue;
+              await new Promise((resChunk, rejChunk) => {
+                const readStream = fs.createReadStream(seg.tempPath, { highWaterMark: 4 * 1024 * 1024 });
+                readStream.on('data', (chunk) => {
+                  const canContinue = writeStream.write(chunk);
+                  if (!canContinue) {
+                    readStream.pause();
+                    writeStream.once('drain', () => readStream.resume());
+                  }
+                });
+                readStream.on('end', resChunk);
+                readStream.on('error', rejChunk);
+              });
             }
-          });
-          readStream.on('end', resolve);
-          readStream.on('error', reject);
+            writeStream.end(() => resolve());
+          })().catch(reject);
         });
+        writeSuccess = true;
+      } catch (err) {
+        if ((err.code === 'EBUSY' || err.code === 'EPERM') && attempts < maxAttempts) {
+          console.warn(`[Merge] Target file locked by antivirus/system (${err.code}). Retrying in 350ms (attempt ${attempts}/${maxAttempts})...`);
+          await new Promise(r => setTimeout(r, 350));
+          continue;
+        }
+        this.handleError(err);
+        return;
       }
-
-      await new Promise((resolve, reject) => {
-        writeStream.end(() => resolve());
-        writeStream.on('error', reject);
-      });
-    } catch (err) {
-      this.handleError(err);
-      return;
     }
 
     // Clean up segment files
@@ -1394,14 +1470,14 @@ class DownloadTask {
 }
 
 // IPC listeners
-ipcMain.on('start-download', (event, { id, url, saveFolder, fileName, cookies, referrer }) => {
+ipcMain.on('start-download', (event, { id, url, saveFolder, fileName, cookies, referrer, userAgent }) => {
   console.log(`Starting download: ${url} -> ${saveFolder}/${fileName}`);
   
   if (activeDownloads[id]) {
     activeDownloads[id].cleanup();
   }
   
-  const task = new DownloadTask(id, url, saveFolder, fileName, cookies, referrer);
+  const task = new DownloadTask(id, url, saveFolder, fileName, cookies, referrer, userAgent);
   activeDownloads[id] = task;
   task.start();
 });
@@ -1417,6 +1493,10 @@ ipcMain.on('resume-download', (event, id) => {
   console.log(`Resuming download: ${id}`);
   if (activeDownloads[id]) {
     activeDownloads[id].start();
+  } else {
+    if (mainWindow) {
+      mainWindow.webContents.send('download-needs-restart', id);
+    }
   }
 });
 
@@ -1449,7 +1529,8 @@ ipcMain.on('confirm-prompt-download', (event, data) => {
       fileName: data.name,
       savePath: data.savePath,
       cookies: data.cookies || '',
-      referrer: data.referrer || ''
+      referrer: data.referrer || '',
+      userAgent: data.userAgent || ''
     });
 
     if (mainWindow.isMinimized()) mainWindow.restore();

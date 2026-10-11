@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "IDM Lite Integration Module",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Chuyển tiếp mọi lượt tải xuống sang IDM Lite (Developed by HuyTran1002)",
   "permissions": [
     "downloads",

@@ -251,9 +251,13 @@ function App() {
 
   // Update notification state
   const [updateInfo, setUpdateInfo] = useState(null);
-  const [appVersion, setAppVersion] = useState('1.0.6');
+  const [updateState, setUpdateState] = useState('idle'); // 'idle' | 'available' | 'downloading' | 'installing' | 'error'
+  const [updateProgress, setUpdateProgress] = useState({ percent: 0, transferred: 0, total: 0, speed: 0 });
+  const [updateError, setUpdateError] = useState('');
+  const [updateFeedback, setUpdateFeedback] = useState(null);
+  const [appVersion, setAppVersion] = useState('1.0.7');
   const [extensionStatus, setExtensionStatus] = useState({
-    bundledVersion: '1.0.6',
+    bundledVersion: '1.0.7',
     installedVersion: 'Chưa nhận diện',
     needsUpdate: false
   });
@@ -317,12 +321,43 @@ function App() {
 
   // Listen for update notifications from main process
   useEffect(() => {
-    if (isDesktop && window.api.onUpdateAvailable) {
-      const unsubscribe = window.api.onUpdateAvailable((event, data) => {
+    if (!isDesktop) return;
+
+    const unsubs = [];
+    if (window.api.onUpdateAvailable) {
+      unsubs.push(window.api.onUpdateAvailable((event, data) => {
         setUpdateInfo(data);
-      });
-      return () => unsubscribe();
+        setUpdateState('available');
+        setIsCheckingUpdate(false);
+      }));
     }
+    if (window.api.onUpdateNotAvailable) {
+      unsubs.push(window.api.onUpdateNotAvailable((event, data) => {
+        setIsCheckingUpdate(false);
+        setUpdateFeedback({ type: 'latest', message: `Bạn đang dùng phiên bản mới nhất (v${data.currentVersion}).` });
+        setTimeout(() => setUpdateFeedback(null), 4000);
+      }));
+    }
+    if (window.api.onUpdateDownloadProgress) {
+      unsubs.push(window.api.onUpdateDownloadProgress((event, data) => {
+        setUpdateProgress(data);
+        setUpdateState('downloading');
+      }));
+    }
+    if (window.api.onUpdateDownloadComplete) {
+      unsubs.push(window.api.onUpdateDownloadComplete(() => {
+        setUpdateState('installing');
+      }));
+    }
+    if (window.api.onUpdateError) {
+      unsubs.push(window.api.onUpdateError((_event, errMsg) => {
+        setUpdateError(errMsg);
+        setUpdateState('error');
+        setIsCheckingUpdate(false);
+      }));
+    }
+
+    return () => unsubs.forEach(u => u());
   }, [isDesktop]);
 
   // Save config to localStorage
@@ -567,9 +602,25 @@ function App() {
   const handleCheckForUpdates = async () => {
     if (!isDesktop || !window.api.checkForUpdates) return;
     setIsCheckingUpdate(true);
+    setUpdateFeedback(null);
     await window.api.checkForUpdates();
-    // Give time for the update-available event to come back if there is one
-    setTimeout(() => setIsCheckingUpdate(false), 3000);
+    setTimeout(() => setIsCheckingUpdate(false), 5000);
+  };
+
+  const handleStartUpdate = () => {
+    if (!updateInfo || !window.api?.startAppUpdate) return;
+    setUpdateState('downloading');
+    setUpdateProgress({ percent: 0, transferred: 0, total: updateInfo.assetSize || 0, speed: 0 });
+    setUpdateError('');
+    window.api.startAppUpdate(updateInfo);
+  };
+
+  const handleCancelUpdate = () => {
+    if (window.api?.cancelAppUpdate) {
+      window.api.cancelAppUpdate();
+    }
+    setUpdateState('available');
+    setUpdateProgress({ percent: 0, transferred: 0, total: 0, speed: 0 });
   };
 
   const handleOpenFolder = (item) => {
@@ -806,70 +857,213 @@ function App() {
       </header>
 
       {/* Update notification banner */}
-      {updateInfo && (
+      {updateInfo && updateState !== 'idle' && (
         <div style={{
-          background: 'linear-gradient(90deg, rgba(0,230,118,0.12) 0%, rgba(0,180,255,0.10) 100%)',
-          borderBottom: '1px solid rgba(0,230,118,0.35)',
-          padding: '8px 18px',
+          background: updateState === 'error'
+            ? 'linear-gradient(90deg, rgba(255,82,82,0.15) 0%, rgba(20,20,20,0.95) 100%)'
+            : 'linear-gradient(90deg, rgba(0,230,118,0.12) 0%, rgba(0,180,255,0.10) 100%)',
+          borderBottom: updateState === 'error'
+            ? '1px solid rgba(255,82,82,0.35)'
+            : '1px solid rgba(0,230,118,0.35)',
+          padding: '10px 20px',
           display: 'flex',
-          alignItems: 'center',
-          gap: '12px',
+          flexDirection: 'column',
+          gap: '8px',
           animation: 'slideDown 0.35s ease',
           position: 'relative',
           zIndex: 10
         }}>
-          {/* Pulse dot */}
           <div style={{
-            width: '8px', height: '8px', borderRadius: '50%',
-            background: 'var(--idm-green)',
-            boxShadow: '0 0 8px var(--idm-green)',
-            animation: 'pulse 1.5s ease-in-out infinite',
-            flexShrink: 0
-          }} />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <span style={{ fontSize: '13px', fontWeight: 700, color: '#fff' }}>
-              🎉 Phiên bản mới {updateInfo.latestVersion} có sẵn!
-            </span>
-            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginLeft: '10px' }}>
-              (Hiện tại: v{updateInfo.currentVersion})
-            </span>
-            {updateInfo.releaseNotes && (
-              <div style={{
-                fontSize: '11px', color: 'var(--color-text-secondary)',
-                marginTop: '2px', whiteSpace: 'nowrap',
-                overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '500px'
-              }}>
-                {updateInfo.releaseNotes.split('\n')[0]}
-              </div>
-            )}
-          </div>
-          <button
-            onClick={() => window.api?.openReleaseUrl(updateInfo.releaseUrl)}
-            style={{
-              background: 'linear-gradient(135deg, var(--idm-green), #00b4ff)',
-              color: '#000', border: 'none', borderRadius: '6px',
-              padding: '6px 18px', fontWeight: 800, fontSize: '12px',
-              cursor: 'pointer', flexShrink: 0,
-              boxShadow: '0 2px 12px rgba(0,230,118,0.4)',
-              transition: 'all 0.2s'
-            }}
-            onMouseEnter={e => e.target.style.transform = 'scale(1.05)'}
-            onMouseLeave={e => e.target.style.transform = 'scale(1)'}
-          >
-            ⬇ Tải cập nhật
-          </button>
-          <button
-            onClick={() => setUpdateInfo(null)}
-            title="Bỏ qua lần này"
-            style={{
-              background: 'transparent', border: 'none',
-              color: 'var(--color-text-muted)', cursor: 'pointer',
-              fontSize: '16px', padding: '2px 4px', lineHeight: 1,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '12px',
+            width: '100%'
+          }}>
+            {/* Pulse dot */}
+            <div style={{
+              width: '10px', height: '10px', borderRadius: '50%',
+              background: updateState === 'error' ? '#ff5252' : updateState === 'downloading' ? '#00b4ff' : 'var(--idm-green)',
+              boxShadow: updateState === 'error' ? '0 0 10px #ff5252' : updateState === 'downloading' ? '0 0 10px #00b4ff' : '0 0 10px var(--idm-green)',
+              animation: 'pulse 1.5s ease-in-out infinite',
               flexShrink: 0
-            }}
-          >
-            ×
-          </button>
+            }} />
+
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {updateState === 'available' && (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: '13px', fontWeight: 700, color: '#fff' }}>
+                      🎉 Đã có bản cập nhật mới v{updateInfo.latestVersion}!
+                    </span>
+                    <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
+                      (Hiện tại: v{updateInfo.currentVersion}{updateInfo.assetSize ? ` • ${formatBytes(updateInfo.assetSize)}` : ''})
+                    </span>
+                  </div>
+                  {updateInfo.releaseNotes && (
+                    <div style={{
+                      fontSize: '11px', color: 'var(--color-text-secondary)',
+                      marginTop: '2px', whiteSpace: 'nowrap',
+                      overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '600px'
+                    }}>
+                      {updateInfo.releaseNotes.split('\n')[0]}
+                    </div>
+                  )}
+                </>
+              )}
+
+              {updateState === 'downloading' && (
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                    <span style={{ fontSize: '13px', fontWeight: 700, color: '#fff' }}>
+                      ⏳ Đang tải bản cập nhật v{updateInfo.latestVersion}... {updateProgress.percent}%
+                    </span>
+                    <span style={{ fontSize: '11px', color: 'var(--idm-green)', fontWeight: 600 }}>
+                      {updateProgress.transferred > 0 && `${formatBytes(updateProgress.transferred)} / ${formatBytes(updateProgress.total)}`}
+                      {updateProgress.speed > 0 && ` • ${formatSpeed(updateProgress.speed)}`}
+                    </span>
+                  </div>
+                  {/* Progress bar */}
+                  <div style={{
+                    width: '100%', height: '6px',
+                    background: 'rgba(255,255,255,0.08)',
+                    borderRadius: '4px', overflow: 'hidden'
+                  }}>
+                    <div style={{
+                      height: '100%',
+                      width: `${updateProgress.percent}%`,
+                      background: 'linear-gradient(90deg, var(--idm-green), #00b4ff)',
+                      transition: 'width 0.3s ease',
+                      boxShadow: '0 0 8px rgba(0,230,118,0.5)'
+                    }} />
+                  </div>
+                </div>
+              )}
+
+              {updateState === 'installing' && (
+                <div>
+                  <div style={{ fontSize: '13px', fontWeight: 700, color: 'var(--idm-green)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span>🚀 Tải xong 100%! Đang tắt ứng dụng và cài đặt bản mới...</span>
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                    Ứng dụng sẽ tự động gỡ/thay thế bản cũ và khởi chạy lại bản mới trong giây lát.
+                  </div>
+                </div>
+              )}
+
+              {updateState === 'error' && (
+                <div>
+                  <div style={{ fontSize: '13px', fontWeight: 700, color: '#ff5252' }}>
+                    ❌ Lỗi cập nhật: {updateError || 'Không thể tải bản cập nhật'}
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                    Bạn có thể thử lại cập nhật tự động hoặc tải tệp cài đặt thủ công từ GitHub.
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Action buttons */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+              {updateState === 'available' && (
+                <>
+                  <button
+                    onClick={handleStartUpdate}
+                    style={{
+                      background: 'linear-gradient(135deg, var(--idm-green), #00b4ff)',
+                      color: '#000', border: 'none', borderRadius: '6px',
+                      padding: '6px 16px', fontWeight: 800, fontSize: '12px',
+                      cursor: 'pointer',
+                      boxShadow: '0 2px 12px rgba(0,230,118,0.4)',
+                      transition: 'all 0.2s',
+                      display: 'flex', alignItems: 'center', gap: '6px'
+                    }}
+                    onMouseEnter={e => e.target.style.transform = 'scale(1.05)'}
+                    onMouseLeave={e => e.target.style.transform = 'scale(1)'}
+                  >
+                    ⚡ Cập nhật ngay
+                  </button>
+                  <button
+                    onClick={() => window.api?.openReleaseUrl(updateInfo.releaseUrl)}
+                    title="Mở trang phát hành trên GitHub"
+                    style={{
+                      background: 'rgba(255,255,255,0.06)',
+                      color: 'var(--color-text-secondary)',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '6px', padding: '6px 12px',
+                      fontWeight: 600, fontSize: '12px', cursor: 'pointer',
+                      transition: 'all 0.2s'
+                    }}
+                    onMouseEnter={e => e.target.style.color = '#fff'}
+                    onMouseLeave={e => e.target.style.color = 'var(--color-text-secondary)'}
+                  >
+                    🌐 Chi tiết
+                  </button>
+                  <button
+                    onClick={() => setUpdateState('idle')}
+                    title="Bỏ qua lần này"
+                    style={{
+                      background: 'transparent', border: 'none',
+                      color: 'var(--color-text-muted)', cursor: 'pointer',
+                      fontSize: '18px', padding: '2px 6px', lineHeight: 1
+                    }}
+                  >
+                    ×
+                  </button>
+                </>
+              )}
+
+              {updateState === 'downloading' && (
+                <button
+                  onClick={handleCancelUpdate}
+                  style={{
+                    background: 'rgba(255,82,82,0.15)',
+                    color: '#ff5252', border: '1px solid rgba(255,82,82,0.3)',
+                    borderRadius: '6px', padding: '6px 14px',
+                    fontWeight: 700, fontSize: '12px', cursor: 'pointer'
+                  }}
+                >
+                  ✕ Hủy
+                </button>
+              )}
+
+              {updateState === 'error' && (
+                <>
+                  <button
+                    onClick={handleStartUpdate}
+                    style={{
+                      background: 'linear-gradient(135deg, var(--idm-green), #00b4ff)',
+                      color: '#000', border: 'none', borderRadius: '6px',
+                      padding: '6px 14px', fontWeight: 800, fontSize: '12px',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    🔄 Thử lại
+                  </button>
+                  <button
+                    onClick={() => window.api?.openReleaseUrl(updateInfo.releaseUrl)}
+                    style={{
+                      background: 'rgba(255,255,255,0.06)',
+                      color: '#fff', border: '1px solid var(--border-color)',
+                      borderRadius: '6px', padding: '6px 12px',
+                      fontWeight: 600, fontSize: '12px', cursor: 'pointer'
+                    }}
+                  >
+                    🌐 Tải thủ công
+                  </button>
+                  <button
+                    onClick={() => setUpdateState('idle')}
+                    style={{
+                      background: 'transparent', border: 'none',
+                      color: 'var(--color-text-muted)', cursor: 'pointer',
+                      fontSize: '18px', padding: '2px 6px'
+                    }}
+                  >
+                    ×
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1476,36 +1670,89 @@ function App() {
                   {isDesktop && (
                     <div style={{
                       display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
+                      flexDirection: 'column',
+                      gap: '10px',
                       padding: '12px 14px',
                       background: 'rgba(255,255,255,0.02)',
                       border: '1px solid var(--border-color)',
                       borderRadius: '8px',
                     }}>
-                      <div>
-                        <div style={{ fontSize: '13px', fontWeight: '600', color: '#fff' }}>Kiểm tra cập nhật</div>
-                        <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
-                          Phiên bản hiện tại: <span style={{ color: 'var(--idm-green)', fontWeight: '700' }}>v{appVersion}</span>
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                      }}>
+                        <div>
+                          <div style={{ fontSize: '13px', fontWeight: '600', color: '#fff' }}>Kiểm tra cập nhật</div>
+                          <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                            Phiên bản hiện tại: <span style={{ color: 'var(--idm-green)', fontWeight: '700' }}>v{appVersion}</span>
+                          </div>
                         </div>
+                        <button
+                          className="btn btn-secondary"
+                          style={{
+                            fontSize: '12px',
+                            padding: '6px 14px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            opacity: isCheckingUpdate ? 0.6 : 1,
+                            cursor: isCheckingUpdate ? 'not-allowed' : 'pointer',
+                            transition: 'all 0.2s'
+                          }}
+                          onClick={handleCheckForUpdates}
+                          disabled={isCheckingUpdate}
+                        >
+                          {isCheckingUpdate ? '⏳ Đang kiểm tra...' : '🔄 Kiểm tra ngay'}
+                        </button>
                       </div>
-                      <button
-                        className="btn btn-secondary"
-                        style={{
+
+                      {updateFeedback && (
+                        <div style={{
                           fontSize: '12px',
-                          padding: '6px 14px',
+                          color: updateFeedback.type === 'latest' ? 'var(--idm-green)' : '#ff5252',
+                          fontWeight: 600,
+                          padding: '6px 10px',
+                          background: updateFeedback.type === 'latest' ? 'rgba(0,230,118,0.08)' : 'rgba(255,82,82,0.08)',
+                          borderRadius: '6px',
+                          border: updateFeedback.type === 'latest' ? '1px solid rgba(0,230,118,0.2)' : '1px solid rgba(255,82,82,0.2)'
+                        }}>
+                          {updateFeedback.message}
+                        </div>
+                      )}
+
+                      {updateInfo && updateState === 'available' && (
+                        <div style={{
                           display: 'flex',
                           alignItems: 'center',
-                          gap: '6px',
-                          opacity: isCheckingUpdate ? 0.6 : 1,
-                          cursor: isCheckingUpdate ? 'not-allowed' : 'pointer',
-                          transition: 'all 0.2s'
-                        }}
-                        onClick={handleCheckForUpdates}
-                        disabled={isCheckingUpdate}
-                      >
-                        {isCheckingUpdate ? '⏳ Đang kiểm tra...' : '🔄 Kiểm tra ngay'}
-                      </button>
+                          justifyContent: 'space-between',
+                          padding: '8px 12px',
+                          background: 'rgba(0,230,118,0.08)',
+                          borderRadius: '6px',
+                          border: '1px solid rgba(0,230,118,0.25)',
+                          marginTop: '4px'
+                        }}>
+                          <div>
+                            <div style={{ fontSize: '12px', fontWeight: 700, color: '#fff' }}>
+                              Có bản mới v{updateInfo.latestVersion}
+                            </div>
+                            <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
+                              {updateInfo.assetSize ? formatBytes(updateInfo.assetSize) : 'Sẵn sàng cập nhật'}
+                            </div>
+                          </div>
+                          <button
+                            onClick={handleStartUpdate}
+                            style={{
+                              background: 'linear-gradient(135deg, var(--idm-green), #00b4ff)',
+                              color: '#000', border: 'none', borderRadius: '6px',
+                              padding: '5px 14px', fontWeight: 800, fontSize: '11px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            ⚡ Cập nhật ngay
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

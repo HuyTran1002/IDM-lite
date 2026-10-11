@@ -4,6 +4,7 @@ const fs = require('fs');
 const https = require('https');
 const http = require('http');
 const os = require('os');
+const { spawn } = require('child_process');
 
 // ── Single instance lock ─────────────────────────────────────────────────────
 // Prevent multiple instances from running and competing on port 9091
@@ -86,31 +87,217 @@ function isNewerVersion(latest, current) {
 }
 
 /** Fetch latest release from GitHub and notify renderer if update is available. */
-async function checkForUpdates() {
+async function checkForUpdates(isManual = false) {
   try {
     const currentVersion = app.getVersion();
     const res = await fetch(GITHUB_API_URL, {
       headers: { 'User-Agent': `IDMLite/${currentVersion}` }
     });
-    if (!res.ok) return;
+    if (!res.ok) {
+      if (isManual && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-error', `Không thể kiểm tra cập nhật (HTTP ${res.status})`);
+      }
+      return;
+    }
     const data = await res.json();
     const latestVersion = (data.tag_name || '').replace(/^v/, '');
     if (latestVersion && isNewerVersion(latestVersion, currentVersion)) {
       console.log(`[Update] New version available: ${currentVersion} → ${latestVersion}`);
-      if (mainWindow) {
+      
+      const exeAsset = (data.assets || []).find(a => 
+        a.name && (a.name.endsWith('.exe') || a.name.toLowerCase().includes('setup'))
+      );
+      const downloadUrl = exeAsset ? exeAsset.browser_download_url : `https://github.com/${GITHUB_REPO}/releases/download/v${latestVersion}/IDMLite.Setup.${latestVersion}.exe`;
+      const assetSize = exeAsset ? exeAsset.size : 0;
+      const assetName = exeAsset ? exeAsset.name : `IDMLite.Setup.${latestVersion}.exe`;
+
+      if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('update-available', {
           currentVersion,
           latestVersion,
           releaseNotes: data.body || '',
-          releaseUrl: data.html_url || GITHUB_RELEASES_URL
+          releaseUrl: data.html_url || GITHUB_RELEASES_URL,
+          downloadUrl,
+          assetName,
+          assetSize
         });
       }
     } else {
       console.log(`[Update] App is up to date (v${currentVersion}).`);
+      if (isManual && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-not-available', { currentVersion });
+      }
     }
   } catch (err) {
-    // No internet or API rate limit — silently ignore
     console.log('[Update] Check skipped:', err.message);
+    if (isManual && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-error', err.message || 'Lỗi kết nối khi kiểm tra cập nhật');
+    }
+  }
+}
+
+let activeUpdateReq = null;
+let updateSpeedInterval = null;
+
+function cancelAppUpdate() {
+  if (activeUpdateReq) {
+    try {
+      activeUpdateReq.destroy();
+    } catch (e) {}
+    activeUpdateReq = null;
+  }
+  if (updateSpeedInterval) {
+    clearInterval(updateSpeedInterval);
+    updateSpeedInterval = null;
+  }
+}
+
+function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
+  cancelAppUpdate();
+
+  const follow = (curUrl, redirectCount = 0) => {
+    if (redirectCount > 8) {
+      return onError(new Error('Chuyển hướng quá nhiều lần khi tải bản cập nhật.'));
+    }
+
+    let parsed;
+    try {
+      parsed = new URL(curUrl);
+    } catch (e) {
+      return onError(new Error('Đường dẫn tải bản cập nhật không hợp lệ.'));
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http;
+    const options = {
+      headers: {
+        'User-Agent': DEFAULT_USER_AGENT,
+        'Accept': '*/*'
+      }
+    };
+
+    const req = client.get(curUrl, options, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        let redirectUrl = res.headers.location;
+        if (redirectUrl) {
+          try {
+            redirectUrl = new URL(redirectUrl, curUrl).href;
+          } catch (e) {}
+          return follow(redirectUrl, redirectCount + 1);
+        }
+      }
+
+      if (res.statusCode !== 200) {
+        return onError(new Error(`Máy chủ tải cập nhật trả về mã lỗi: ${res.statusCode}`));
+      }
+
+      const total = parseInt(res.headers['content-length'] || '0', 10);
+      let transferred = 0;
+      let lastTransferred = 0;
+      let speed = 0;
+
+      const fileStream = fs.createWriteStream(destPath);
+
+      updateSpeedInterval = setInterval(() => {
+        speed = Math.max(0, transferred - lastTransferred) * 2;
+        lastTransferred = transferred;
+        const percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
+        onProgress({ percent, transferred, total, speed });
+      }, 500);
+
+      res.on('data', (chunk) => {
+        transferred += chunk.length;
+      });
+
+      res.pipe(fileStream);
+
+      fileStream.on('finish', () => {
+        if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+        activeUpdateReq = null;
+        fileStream.close(() => {
+          onComplete(destPath);
+        });
+      });
+
+      fileStream.on('error', (err) => {
+        if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+        activeUpdateReq = null;
+        try { fs.unlinkSync(destPath); } catch (e) {}
+        onError(err);
+      });
+
+      res.on('error', (err) => {
+        if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+        activeUpdateReq = null;
+        fileStream.destroy();
+        try { fs.unlinkSync(destPath); } catch (e) {}
+        onError(err);
+      });
+    });
+
+    req.on('error', (err) => {
+      if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+      activeUpdateReq = null;
+      onError(err);
+    });
+
+    activeUpdateReq = req;
+  };
+
+  follow(url);
+}
+
+function launchInstallerAndQuit(installerPath) {
+  const currentExe = process.execPath;
+  const isPackaged = app.isPackaged;
+
+  const tempDir = path.dirname(installerPath);
+  const batPath = path.join(tempDir, 'run_update.bat');
+
+  const relaunchCmd = isPackaged ? `start "" "${currentExe}"` : `echo Finished in dev mode`;
+
+  const batContent = `@echo off
+chcp 65001 >nul
+echo [IDMLite Update] Dang chuan bi cai dat ban moi...
+timeout /t 2 /nobreak >nul
+taskkill /F /IM IDMLite.exe >nul 2>&1
+echo [IDMLite Update] Dang cai dat...
+start /wait "" "${installerPath}" /S
+if %errorlevel% neq 0 (
+  start /wait "" "${installerPath}"
+)
+echo [IDMLite Update] Khoi dong lai ung dung...
+${relaunchCmd}
+exit
+`;
+
+  try {
+    fs.writeFileSync(batPath, batContent, 'utf8');
+    const child = spawn('cmd.exe', ['/c', batPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    });
+    child.unref();
+
+    setTimeout(() => {
+      app.isQuitting = true;
+      app.quit();
+    }, 600);
+  } catch (err) {
+    console.error('Failed to launch update script:', err);
+    try {
+      const child = spawn(installerPath, ['/S'], {
+        detached: true,
+        stdio: 'ignore'
+      });
+      child.unref();
+      setTimeout(() => {
+        app.isQuitting = true;
+        app.quit();
+      }, 600);
+    } catch (e2) {
+      console.error('Direct installer execution failed:', e2);
+    }
   }
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,7 +312,7 @@ let isInterceptionEnabled = true;
 let interceptedExtensions = ['zip', 'rar', '7z', 'exe', 'msi', 'dmg', 'pkg', 'deb', 'sh', 'apk', 'iso', 'bin', 'tar', 'gz', 'bz2', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'mp4', 'mkv', 'avi', 'mov', 'wmv', 'mp3', 'wav', 'flac', 'm4a'];
 let startWithWindows = false; // Persisted to config.json; used to reliably track startup state
 
-let extensionVersion = '1.0.6'; // Fallback
+let extensionVersion = '1.0.7'; // Fallback
 let lastSeenExtensionVersion = '';
 
 function loadExtensionVersion() {
@@ -672,13 +859,107 @@ app.on('will-quit', () => {
   }
 });
 
+function normalizeGoogleDriveUrl(url) {
+  if (!url || typeof url !== 'string') return url;
+  try {
+    const match = url.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/);
+    if (match && match[1]) {
+      return `https://drive.usercontent.google.com/download?id=${match[1]}&export=download&authuser=0`;
+    }
+    const matchOpen = url.match(/drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/);
+    if (matchOpen && matchOpen[1]) {
+      return `https://drive.usercontent.google.com/download?id=${matchOpen[1]}&export=download&authuser=0`;
+    }
+    const matchUc = url.match(/drive\.google\.com\/uc\?(?:.*&)?id=([a-zA-Z0-9_-]+)/);
+    if (matchUc && matchUc[1]) {
+      return `https://drive.usercontent.google.com/download?id=${matchUc[1]}&export=download&authuser=0`;
+    }
+  } catch (e) {}
+  return url;
+}
+
+function handleHtmlDownloadResponse(res, targetUrl, task) {
+  let bodyBuffer = '';
+  res.on('data', (chunk) => {
+    if (bodyBuffer.length < 65536) {
+      bodyBuffer += chunk.toString();
+    }
+  });
+
+  res.on('end', () => {
+    // 1. Quota Exceeded on Google Drive
+    if (bodyBuffer.includes('Google Drive - Quota exceeded') ||
+        bodyBuffer.includes('Too many users have viewed or downloaded this file recently') ||
+        bodyBuffer.includes('vượt quá giới hạn')) {
+      task.handleError(new Error('Tệp Google Drive đã bị giới hạn tải xuống trong ngày (Quota Exceeded). Google Drive tạm khóa tệp do có quá nhiều lượt tải gần đây. Vui lòng thử lại sau 24h hoặc đăng nhập Google Drive để tạo bản sao (Make a copy) vào Drive cá nhân trước khi tải.'));
+      return;
+    }
+
+    // 2. Google Drive Virus Scan Warning Form (auto-bypass for large files > 100MB)
+    if (bodyBuffer.includes('Google Drive - Virus scan warning') ||
+        bodyBuffer.includes('download-form') ||
+        bodyBuffer.includes('uc-download-link')) {
+      
+      const formActionMatch = bodyBuffer.match(/<form[^>]*action="([^"]+)"[^>]*>/i);
+      const action = formActionMatch ? formActionMatch[1] : null;
+      const inputRegex = /<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"/gi;
+      const params = new URLSearchParams();
+      let match;
+      while ((match = inputRegex.exec(bodyBuffer)) !== null) {
+        params.set(match[1], match[2]);
+      }
+
+      // Try extracting real filename from Google Drive warning HTML if available
+      const nameMatch = bodyBuffer.match(/<span class="uc-name-size"><a[^>]*>([^<]+)<\/a>/i);
+      if (nameMatch && nameMatch[1]) {
+        const extractedName = sanitizeFilename(nameMatch[1].trim());
+        if (extractedName && (!task.fileName || task.fileName.startsWith('download_file_') || task.fileName === 'download' || !task.fileName.includes('.'))) {
+          task.filePath = resolveUniqueFilePath(task.saveFolder, extractedName);
+          task.fileName = path.basename(task.filePath);
+          task.category = detectCategory(task.fileName);
+        }
+      }
+
+      // Merge cookies
+      const rawCookies = res.headers['set-cookie'];
+      if (rawCookies) {
+        const newCookieArr = Array.isArray(rawCookies) ? rawCookies : [rawCookies];
+        const cookieStr = newCookieArr.map(c => c.split(';')[0]).join('; ');
+        task.cookies = task.cookies ? `${task.cookies}; ${cookieStr}` : cookieStr;
+      }
+
+      if (action && params.toString()) {
+        let resolvedAction = action;
+        try {
+          resolvedAction = new URL(action, targetUrl).href;
+        } catch (e) {}
+
+        const confirmedUrl = resolvedAction.includes('?')
+          ? `${resolvedAction}&${params.toString()}`
+          : `${resolvedAction}?${params.toString()}`;
+
+        console.log(`[Google Drive] Auto-bypassing virus scan warning: ${confirmedUrl}`);
+        task.startSingleConnectionDownload(confirmedUrl);
+        return;
+      }
+    }
+
+    // Default error for unexpected HTML responses
+    task.handleError(new Error('Server trả về trang web (HTML) thay vì file tải xuống. Vui lòng kiểm tra lại quyền đăng nhập hoặc liên kết.'));
+  });
+
+  res.on('error', (err) => {
+    task.handleError(err);
+  });
+}
+
 // Download Manager state
 const activeDownloads = {};
 
 class DownloadTask {
   constructor(id, url, saveFolder, fileName, cookies, referrer, userAgent) {
     this.id = id;
-    this.url = url;
+    this.url = normalizeGoogleDriveUrl(url);
     this.saveFolder = saveFolder;
     // Resolve a unique file path up-front so we never overwrite an existing file
     const safeFileName = sanitizeFilename(fileName);
@@ -829,10 +1110,10 @@ class DownloadTask {
         const isHtmlResponse = contentType.includes('text/html') || contentType.includes('application/xhtml+xml');
         const ext = this.fileName.split('.').pop().toLowerCase();
         const nonHtmlExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'exe', 'msi', 'dmg', 'pkg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'mp4', 'mkv', 'mp3', 'bin', 'dll', 'iso'];
+        const isGoogleDrive = targetUrl.includes('drive.google') || targetUrl.includes('drive.usercontent.google');
         
-        if (isHtmlResponse && nonHtmlExtensions.includes(ext)) {
-          this.handleError(new Error('Server trả về trang web (HTML) thay vì file tải xuống. Vui lòng kiểm tra lại quyền đăng nhập hoặc liên kết.'));
-          req.destroy();
+        if (isHtmlResponse && (nonHtmlExtensions.includes(ext) || isGoogleDrive)) {
+          handleHtmlDownloadResponse(res, targetUrl, this);
           return;
         }
 
@@ -934,10 +1215,10 @@ class DownloadTask {
         const isHtmlResponse = contentType.includes('text/html') || contentType.includes('application/xhtml+xml');
         const ext = this.fileName.split('.').pop().toLowerCase();
         const nonHtmlExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'exe', 'msi', 'dmg', 'pkg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'mp4', 'mkv', 'mp3', 'bin', 'dll', 'iso'];
+        const isGoogleDrive = targetUrl.includes('drive.google') || targetUrl.includes('drive.usercontent.google');
         
-        if (isHtmlResponse && nonHtmlExtensions.includes(ext)) {
-          this.handleError(new Error('Server trả về trang web (HTML) thay vì file tải xuống. Vui lòng kiểm tra lại quyền đăng nhập hoặc liên kết.'));
-          res.req.destroy();
+        if (isHtmlResponse && (nonHtmlExtensions.includes(ext) || isGoogleDrive)) {
+          handleHtmlDownloadResponse(res, targetUrl, this);
           return;
         }
 
@@ -1613,8 +1894,61 @@ ipcMain.on('open-release-url', (event, url) => {
 
 // Manual update check triggered by user from UI
 ipcMain.handle('check-for-updates', async () => {
-  await checkForUpdates();
+  await checkForUpdates(true);
   return { success: true };
+});
+
+ipcMain.on('start-app-update', (event, updateInfo) => {
+  if (!updateInfo || !updateInfo.downloadUrl) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-error', 'Không tìm thấy liên kết tải bản cập nhật.');
+    }
+    return;
+  }
+
+  const tempDir = path.join(app.getPath('temp'), 'IDMLite-Update');
+  try {
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+  } catch (err) {
+    console.error('Failed to create update directory:', err);
+  }
+
+  const assetName = updateInfo.assetName || `IDMLite.Setup.${updateInfo.latestVersion || 'update'}.exe`;
+  const installerPath = path.join(tempDir, assetName);
+
+  console.log(`[Update] Starting download from ${updateInfo.downloadUrl} to ${installerPath}`);
+
+  downloadUpdate(
+    updateInfo.downloadUrl,
+    installerPath,
+    (progress) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-download-progress', progress);
+      }
+    },
+    (completedPath) => {
+      console.log(`[Update] Download completed: ${completedPath}`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-download-complete', { installerPath: completedPath });
+      }
+      setTimeout(() => {
+        launchInstallerAndQuit(completedPath);
+      }, 1200);
+    },
+    (err) => {
+      console.error('[Update] Download error:', err);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-error', err.message || 'Lỗi khi tải bản cập nhật');
+      }
+    }
+  );
+});
+
+ipcMain.on('cancel-app-update', () => {
+  console.log('[Update] User cancelled update download.');
+  cancelAppUpdate();
 });
 
 ipcMain.on('open-extension-folder', () => {

@@ -51,6 +51,28 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('update-available', subscription);
     return () => ipcRenderer.removeListener('update-available', subscription);
   },
+  onUpdateNotAvailable: (callback) => {
+    const subscription = (event, value) => callback(event, value);
+    ipcRenderer.on('update-not-available', subscription);
+    return () => ipcRenderer.removeListener('update-not-available', subscription);
+  },
+  startAppUpdate: (updateInfo) => ipcRenderer.send('start-app-update', updateInfo),
+  cancelAppUpdate: () => ipcRenderer.send('cancel-app-update'),
+  onUpdateDownloadProgress: (callback) => {
+    const subscription = (event, value) => callback(event, value);
+    ipcRenderer.on('update-download-progress', subscription);
+    return () => ipcRenderer.removeListener('update-download-progress', subscription);
+  },
+  onUpdateDownloadComplete: (callback) => {
+    const subscription = (event, value) => callback(event, value);
+    ipcRenderer.on('update-download-complete', subscription);
+    return () => ipcRenderer.removeListener('update-download-complete', subscription);
+  },
+  onUpdateError: (callback) => {
+    const subscription = (event, value) => callback(event, value);
+    ipcRenderer.on('update-error', subscription);
+    return () => ipcRenderer.removeListener('update-error', subscription);
+  },
   openReleaseUrl: (url) => ipcRenderer.send('open-release-url', url),
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
   getVersion: () => ipcRenderer.invoke('get-version'),

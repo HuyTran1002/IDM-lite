@@ -2,7 +2,17 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
   isElectron: true,
-  startDownload: (id, url, saveFolder, fileName, cookies, referrer, userAgent) => ipcRenderer.send('start-download', { id, url, saveFolder, fileName, cookies, referrer, userAgent }),
+  startDownload: (id, url, saveFolder, fileName, cookies, referrer, userAgent, extra = {}) =>
+    ipcRenderer.send('start-download', {
+      id,
+      url,
+      saveFolder,
+      fileName,
+      cookies,
+      referrer,
+      userAgent,
+      ...(extra && typeof extra === 'object' ? extra : {})
+    }),
   pauseDownload: (id) => ipcRenderer.send('pause-download', id),
   resumeDownload: (id) => ipcRenderer.send('resume-download', id),
   onDownloadNeedsRestart: (callback) => {
@@ -15,6 +25,7 @@ contextBridge.exposeInMainWorld('api', {
   cancelDownload: (id) => ipcRenderer.send('cancel-download', id),
   openFolder: (folderPath) => ipcRenderer.send('open-folder', folderPath),
   confirmPromptDownload: (data) => ipcRenderer.send('confirm-prompt-download', data),
+  getPendingPrompt: () => ipcRenderer.invoke('get-pending-prompt'),
   openExtensionFolder: () => ipcRenderer.send('open-extension-folder'),
   exportExtensionFolder: () => ipcRenderer.invoke('export-extension-folder'),
   getExtensionPath: () => ipcRenderer.invoke('get-extension-path'),

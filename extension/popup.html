@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IDM Lite Video Grabber</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      width: 390px;
+      background: #0d0e12;
+      color: #f3f4f6;
+      font-family: 'Segoe UI', Inter, system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      background: linear-gradient(to right, #1a1c29, #12131c);
+      border-bottom: 1px solid #23273a;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-weight: 700;
+      font-size: 13px;
+    }
+    .logo {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #00b050, #00e676);
+      color: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      font-size: 14px;
+    }
+    .status-pill {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 12px;
+      background: rgba(255, 82, 82, 0.12);
+      color: #ff6b6b;
+      border: 1px solid rgba(255, 82, 82, 0.3);
+    }
+    .status-pill.online {
+      background: rgba(0, 230, 118, 0.12);
+      color: #00e676;
+      border-color: rgba(0, 230, 118, 0.3);
+    }
+    .section {
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .card {
+      background: #14161f;
+      border: 1px solid #23273a;
+      border-radius: 8px;
+      padding: 11px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .card-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #9ca3af;
+    }
+    .page-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    select {
+      flex: 1;
+      background: #0d0e12;
+      border: 1px solid #282d44;
+      color: #fff;
+      padding: 7px 9px;
+      border-radius: 6px;
+      font-size: 12px;
+      outline: none;
+    }
+    select:focus {
+      border-color: #00e676;
+    }
+    .btn-primary {
+      background: #00e676;
+      color: #000;
+      border: none;
+      border-radius: 6px;
+      padding: 7px 14px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-primary:hover {
+      background: #00ff84;
+    }
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .stream-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+    .stream-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: #14161f;
+      border: 1px solid #23273a;
+      border-radius: 7px;
+      padding: 8px 10px;
+    }
+    .stream-info {
+      min-width: 0;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .stream-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .stream-meta {
+      display: flex;
+      gap: 6px;
+      font-size: 10px;
+      color: #9ca3af;
+      align-items: center;
+    }
+    .tag {
+      background: rgba(0, 230, 118, 0.12);
+      color: #00e676;
+      border: 1px solid rgba(0, 230, 118, 0.25);
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-weight: 700;
+    }
+    .btn-dl {
+      background: rgba(0, 230, 118, 0.15);
+      color: #00e676;
+      border: 1px solid rgba(0, 230, 118, 0.4);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .btn-dl:hover {
+      background: #00e676;
+      color: #000;
+    }
+    .empty {
+      text-align: center;
+      color: #6b7280;
+      font-size: 12px;
+      padding: 14px 8px;
+      background: #14161f;
+      border: 1px dashed #23273a;
+      border-radius: 8px;
+      line-height: 1.45;
+    }
+    .feedback {
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      display: none;
+    }
+    .feedback.ok {
+      display: block;
+      background: rgba(0, 230, 118, 0.12);
+      color: #00e676;
+      border: 1px solid rgba(0, 230, 118, 0.3);
+    }
+    .feedback.err {
+      display: block;
+      background: rgba(255, 82, 82, 0.12);
+      color: #ff6b6b;
+      border: 1px solid rgba(255, 82, 82, 0.3);
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <div class="logo">↓</div>
+      <span>IDM Lite Video Grabber</span>
+    </div>
+    <span class="status-pill" id="app-status">Đang kiểm tra...</span>
+  </header>
+
+  <main class="section">
+    <div class="card">
+      <div class="card-title">Tải video từ trang hiện tại</div>
+      <div class="page-title" id="page-title">Đang tải thông tin tab...</div>
+      <div class="row">
+        <select id="quality-select">
+          <option value="best">Chất lượng cao nhất (1080p+ / 4K)</option>
+          <option value="720p">720p HD (MP4)</option>
+          <option value="480p">480p (Tiết kiệm)</option>
+          <option value="audio">Chỉ tải âm thanh (M4A / MP3)</option>
+        </select>
+        <button class="btn-primary" id="download-page-btn">Tải ngay</button>
+      </div>
+    </div>
+
+    <div id="feedback-box" class="feedback"></div>
+
+    <div class="card-title" style="margin-top: 2px;">Stream / Media bắt được trên tab (<span id="stream-count">0</span>)</div>
+    <div class="stream-list" id="stream-list"></div>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

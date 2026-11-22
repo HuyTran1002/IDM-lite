@@ -79,7 +79,7 @@ const INITIAL_DOWNLOADS = [
 const detectCategory = (filename) => {
   const ext = filename.split('.').pop().toLowerCase();
   const docExtensions = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'epub', 'md'];
-  const videoExtensions = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', '3gp'];
+  const videoExtensions = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', '3gp', 'm3u8', 'ts', 'm4v'];
   const musicExtensions = ['mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'wma'];
   const programExtensions = ['exe', 'msi', 'dmg', 'pkg', 'deb', 'sh', 'apk', 'iso', 'bin'];
   const zipExtensions = ['zip', 'rar', '7z', 'tar', 'gz', 'bz2'];
@@ -89,6 +89,25 @@ const detectCategory = (filename) => {
   if (musicExtensions.includes(ext)) return 'music';
   if (programExtensions.includes(ext) || zipExtensions.includes(ext)) return 'program';
   return 'other';
+};
+
+const isVideoStreamOrPlatform = (urlStr) => {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  const lower = urlStr.toLowerCase();
+  if (/\.(m3u8|mpd|mp4|webm|mkv|mov|flv)(\?|$|#)/i.test(lower) || lower.startsWith('blob:')) {
+    return true;
+  }
+  const hosts = [
+    'youtube.com', 'youtu.be', 'tiktok.com', 'facebook.com', 'fb.watch',
+    'instagram.com', 'twitter.com', 'x.com', 'vimeo.com', 'bilibili.com',
+    'dailymotion.com', 'twitch.tv', 'reddit.com', 'soundcloud.com', 'threads.net', 'douyin.com'
+  ];
+  try {
+    const host = new URL(urlStr).hostname.toLowerCase();
+    return hosts.some((d) => host === d || host.endsWith('.' + d));
+  } catch {
+    return false;
+  }
 };
 
 const formatBytes = (bytes, decimals = 1) => {
@@ -191,23 +210,29 @@ function App() {
           fileName: searchParams.get('fileName') || '',
           cookies: searchParams.get('cookies') || '',
           referrer: searchParams.get('referrer') || '',
-          userAgent: searchParams.get('userAgent') || ''
+          userAgent: searchParams.get('userAgent') || '',
+          isVideo: searchParams.get('isVideo') === '1'
         };
       }
     } catch (e) {
       console.error('Error parsing prompt parameters from hash', e);
     }
-    return { url: '', fileName: '', cookies: '', referrer: '', userAgent: '' };
+    return { url: '', fileName: '', cookies: '', referrer: '', userAgent: '', isVideo: false };
   };
 
   const initialParams = getPromptParams();
 
   // PROMPT MODE STATE
   const [promptUrl, setPromptUrl] = useState(initialParams.url);
+  const [promptPageUrl, setPromptPageUrl] = useState('');
   const [promptName, setPromptName] = useState(initialParams.fileName);
   const [promptCookies, setPromptCookies] = useState(initialParams.cookies);
+  const [promptCookieList, setPromptCookieList] = useState([]);
   const [promptReferrer, setPromptReferrer] = useState(initialParams.referrer);
   const [promptUserAgent, setPromptUserAgent] = useState(initialParams.userAgent || '');
+  const [promptIsVideo, setPromptIsVideo] = useState(initialParams.isVideo);
+  const [promptVideoType, setPromptVideoType] = useState('auto');
+  const [promptQuality, setPromptQuality] = useState('best');
   const [promptSavePath, setPromptSavePath] = useState(() => {
     return localStorage.getItem('idm_default_save_path') || 'C:\\Downloads';
   });
@@ -255,9 +280,9 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState({ percent: 0, transferred: 0, total: 0, speed: 0 });
   const [updateError, setUpdateError] = useState('');
   const [updateFeedback, setUpdateFeedback] = useState(null);
-  const [appVersion, setAppVersion] = useState('1.0.7');
+  const [appVersion, setAppVersion] = useState('1.0.8');
   const [extensionStatus, setExtensionStatus] = useState({
-    bundledVersion: '1.0.7',
+    bundledVersion: '1.0.8',
     installedVersion: 'Chưa nhận diện',
     needsUpdate: false
   });
@@ -386,6 +411,7 @@ function App() {
                 size: data.total || item.size,
                 speed: data.speed,
                 status: data.status,
+                statusNote: data.statusNote || '',
                 savePath: data.savePath || item.savePath,
                 name: data.name || item.name,
                 category: data.category || item.category,
@@ -411,31 +437,48 @@ function App() {
         const category = detectCategory(name);
         const saveFolder = data.savePath || defaultSavePath;
         const url = data.url;
+        const pageUrl = data.pageUrl || '';
         const cookies = data.cookies || '';
+        const cookieList = Array.isArray(data.cookieList) ? data.cookieList : [];
         const referrer = data.referrer || '';
         const userAgent = data.userAgent || '';
+        const isVideo = Boolean(data.isVideo);
+        const videoType = data.videoType || 'auto';
+        const quality = data.quality || 'best';
 
         // Create item and start downloading immediately without opening another modal
         const newItem = {
           id: Date.now().toString(),
           name,
           url,
+          pageUrl,
           size: 0,
           downloaded: 0,
           status: 'downloading',
+          statusNote: '',
           speed: 0,
           category,
           savePath: saveFolder,
           addedAt: Date.now(),
           cookies,
+          cookieList,
           referrer,
-          userAgent
+          userAgent,
+          isVideo,
+          videoType,
+          quality
         };
 
         setDownloads((prev) => [newItem, ...prev]);
 
         if (window.api.startDownload) {
-          window.api.startDownload(newItem.id, newItem.url, saveFolder, name, cookies, referrer, userAgent);
+          window.api.startDownload(newItem.id, newItem.url, saveFolder, name, cookies, referrer, userAgent, {
+            pageUrl,
+            cookieList,
+            isVideo,
+            videoType,
+            quality
+          });
         }
       });
       return () => unsubscribe();
@@ -448,7 +491,13 @@ function App() {
       const unsubscribe = window.api.onDownloadNeedsRestart((event, id) => {
         const item = downloads.find((d) => d.id === id);
         if (item && window.api.startDownload) {
-          window.api.startDownload(item.id, item.url, item.savePath, item.name, item.cookies, item.referrer, item.userAgent);
+          window.api.startDownload(item.id, item.url, item.savePath, item.name, item.cookies, item.referrer, item.userAgent, {
+            pageUrl: item.pageUrl || '',
+            cookieList: item.cookieList || [],
+            isVideo: Boolean(item.isVideo),
+            videoType: item.videoType || 'auto',
+            quality: item.quality || 'best'
+          });
         }
       });
       return () => unsubscribe();
@@ -457,13 +506,29 @@ function App() {
 
   // LISTEN FOR PROMPT WINDOW INITIALIZATION DATA
   useEffect(() => {
-    if (isPromptMode && isDesktop && window.api.onInitPrompt) {
+    if (!isPromptMode || !isDesktop) return;
+
+    const applyPromptData = (data) => {
+      if (!data) return;
+      if (data.url) setPromptUrl(data.url);
+      if (data.pageUrl !== undefined) setPromptPageUrl(data.pageUrl || '');
+      if (data.fileName) setPromptName(data.fileName);
+      if (data.cookies !== undefined) setPromptCookies(data.cookies || '');
+      if (Array.isArray(data.cookieList)) setPromptCookieList(data.cookieList);
+      if (data.referrer !== undefined) setPromptReferrer(data.referrer || '');
+      if (data.userAgent !== undefined) setPromptUserAgent(data.userAgent || '');
+      if (data.isVideo !== undefined) setPromptIsVideo(Boolean(data.isVideo));
+      if (data.videoType) setPromptVideoType(data.videoType);
+      if (data.quality) setPromptQuality(data.quality);
+    };
+
+    if (window.api.getPendingPrompt) {
+      window.api.getPendingPrompt().then(applyPromptData).catch(() => {});
+    }
+
+    if (window.api.onInitPrompt) {
       const unsubscribe = window.api.onInitPrompt((event, data) => {
-        setPromptUrl(data.url);
-        setPromptName(data.fileName);
-        setPromptCookies(data.cookies || '');
-        setPromptReferrer(data.referrer || '');
-        setPromptUserAgent(data.userAgent || '');
+        applyPromptData(data);
       });
       return () => unsubscribe();
     }
@@ -512,8 +577,10 @@ function App() {
       const parsedUrl = new URL(url);
       const pathname = parsedUrl.pathname;
       const filename = pathname.substring(pathname.lastIndexOf('/') + 1);
-      if (filename && filename.includes('.')) {
+      if (filename && filename.includes('.') && !/\.m3u8$/i.test(filename)) {
         setNewName(decodeURIComponent(filename));
+      } else if (isVideoStreamOrPlatform(url)) {
+        setNewName('video_' + Math.floor(Math.random() * 10000) + '.mp4');
       } else {
         setNewName('download_file_' + Math.floor(Math.random() * 1000));
       }
@@ -534,7 +601,11 @@ function App() {
     const multiplier = newSizeUnit === 'GB' ? 1024 * 1024 * 1024 : 1024 * 1024;
     sizeInBytes = Math.floor(sizeInBytes * multiplier);
 
-    const name = newName.trim() || 'untitled_download_' + Date.now();
+    const isVideo = isVideoStreamOrPlatform(newUrl);
+    let name = newName.trim() || (isVideo ? `video_${Date.now()}.mp4` : 'untitled_download_' + Date.now());
+    if (isVideo && !name.includes('.')) {
+      name += '.mp4';
+    }
     const category = detectCategory(name);
     const saveFolder = customSavePath.trim() || defaultSavePath;
 
@@ -542,20 +613,24 @@ function App() {
       id: Date.now().toString(),
       name,
       url: newUrl,
-      size: sizeInBytes,
+      size: isDesktop ? 0 : sizeInBytes,
       downloaded: 0,
       status: 'downloading',
+      statusNote: '',
       speed: 0,
       category,
       savePath: saveFolder,
-      addedAt: Date.now()
+      addedAt: Date.now(),
+      isVideo
     };
 
     setDownloads([newItem, ...downloads]);
     setIsAddModalOpen(false);
 
     if (isDesktop && window.api.startDownload) {
-      window.api.startDownload(newItem.id, newItem.url, saveFolder, name);
+      window.api.startDownload(newItem.id, newItem.url, saveFolder, name, '', '', '', {
+        isVideo
+      });
     } else {
       newItem.speed = Math.floor(1024 * 1024 * (2 + Math.random() * 8));
     }
@@ -573,11 +648,16 @@ function App() {
     if (isDesktop && window.api.confirmPromptDownload) {
       window.api.confirmPromptDownload({
         url: promptUrl,
+        pageUrl: promptPageUrl,
         name: promptName,
         savePath: promptSavePath,
         cookies: promptCookies,
+        cookieList: promptCookieList,
         referrer: promptReferrer,
-        userAgent: promptUserAgent
+        userAgent: promptUserAgent,
+        isVideo: promptIsVideo || isVideoStreamOrPlatform(promptUrl),
+        videoType: promptVideoType,
+        quality: promptQuality
       });
     }
   };
@@ -648,7 +728,13 @@ function App() {
     if (isDesktop) {
       if (item.status === 'failed' && window.api.startDownload) {
         // If task failed earlier, restart with existing file/temp data
-        window.api.startDownload(item.id, item.url, item.savePath, item.name, item.cookies, item.referrer, item.userAgent);
+        window.api.startDownload(item.id, item.url, item.savePath, item.name, item.cookies, item.referrer, item.userAgent, {
+          pageUrl: item.pageUrl || '',
+          cookieList: item.cookieList || [],
+          isVideo: Boolean(item.isVideo),
+          videoType: item.videoType || 'auto',
+          quality: item.quality || 'best'
+        });
       } else if (window.api.resumeDownload) {
         window.api.resumeDownload(id);
       }
@@ -779,11 +865,38 @@ function App() {
 
   // RENDER DEDICATED POPUP PROMPT WINDOW
   if (isPromptMode) {
+    const showVideoQuality = promptIsVideo || isVideoStreamOrPlatform(promptUrl);
+    const handlePromptQualityChange = (e) => {
+      const nextQuality = e.target.value;
+      setPromptQuality(nextQuality);
+      if (promptName) {
+        if (nextQuality === 'audio' && /\.(mp4|mkv|webm|mov|flv)$/i.test(promptName)) {
+          setPromptName(promptName.replace(/\.(mp4|mkv|webm|mov|flv)$/i, '.m4a'));
+        } else if (nextQuality !== 'audio' && /\.(m4a|mp3|aac|ogg)$/i.test(promptName)) {
+          setPromptName(promptName.replace(/\.(m4a|mp3|aac|ogg)$/i, '.mp4'));
+        }
+      }
+    };
+
     return (
       <div className="idm-window" style={{ height: '100vh', backgroundColor: '#14161f' }}>
         <form onSubmit={handlePromptConfirm} style={{ display: 'flex', flexDirection: 'column', height: '100%', boxSizing: 'border-box' }}>
           <header className="modal-header" style={{ padding: '12px 16px' }}>
-            <h3 style={{ margin: 0, fontSize: '14px' }}>Start New Download</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <h3 style={{ margin: 0, fontSize: '14px' }}>{showVideoQuality ? 'Download Video' : 'Start New Download'}</h3>
+              {showVideoQuality && (
+                <span style={{
+                  fontSize: '10px',
+                  fontWeight: 700,
+                  color: '#000',
+                  background: 'var(--idm-green)',
+                  padding: '2px 6px',
+                  borderRadius: '4px'
+                }}>
+                  VIDEO
+                </span>
+              )}
+            </div>
             <button type="button" className="close-btn" onClick={() => window.close()}>
               <X size={16} />
             </button>
@@ -814,6 +927,23 @@ function App() {
                 style={{ padding: '8px 10px', fontSize: '12px' }}
               />
             </div>
+            {showVideoQuality && (
+              <div className="form-group">
+                <label htmlFor="prompt-quality-select" style={{ fontSize: '11px', marginBottom: '2px' }}>Chất lượng / Định dạng Video</label>
+                <select
+                  id="prompt-quality-select"
+                  className="form-input"
+                  value={promptQuality}
+                  onChange={handlePromptQualityChange}
+                  style={{ padding: '8px 10px', fontSize: '12px', background: 'var(--bg-app)', color: '#fff' }}
+                >
+                  <option value="best">Chất lượng cao nhất (1080p+ / 4K)</option>
+                  <option value="720p">720p HD (MP4)</option>
+                  <option value="480p">480p (Tiết kiệm dung lượng)</option>
+                  <option value="audio">Chỉ tải âm thanh (M4A / MP3)</option>
+                </select>
+              </div>
+            )}
             <div className="form-group">
               <label htmlFor="prompt-save-path-input" style={{ fontSize: '11px', marginBottom: '2px' }}>Save To (Folder Path)</label>
               <input
@@ -1360,7 +1490,11 @@ function App() {
                               </div>
                             )}
                             <span className="progress-percent">
-                              {item.status === 'merging' ? 'Merging segments...' : `${percent}% (${formatBytes(item.downloaded)} done)`}
+                              {item.statusNote
+                                ? item.statusNote
+                                : item.status === 'merging'
+                                  ? 'Merging segments...'
+                                  : `${percent}% (${formatBytes(item.downloaded)} done)`}
                             </span>
                           </div>
                         </td>

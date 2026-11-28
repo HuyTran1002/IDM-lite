@@ -44,6 +44,31 @@ const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKi
 
 // Cache working IPv4 addresses for CDN hostnames that suffer ISP/default-DNS blackholes
 const workingHostIpCache = new Map();
+const HOST_IP_CACHE_TTL_MS = 30 * 60 * 1000;
+const MAX_HOST_IP_CACHE = 200;
+
+function getCachedWorkingHostIp(hostname) {
+  if (!hostname) return null;
+  const entry = workingHostIpCache.get(hostname);
+  if (!entry) return null;
+  if (typeof entry === 'string') return entry;
+  if (Date.now() - entry.cachedAt > HOST_IP_CACHE_TTL_MS) {
+    workingHostIpCache.delete(hostname);
+    return null;
+  }
+  return entry.ip || null;
+}
+
+function setCachedWorkingHostIp(hostname, ip) {
+  if (!hostname || !ip) return;
+  if (workingHostIpCache.size >= MAX_HOST_IP_CACHE && !workingHostIpCache.has(hostname)) {
+    const oldest = workingHostIpCache.keys().next().value;
+    if (oldest) workingHostIpCache.delete(oldest);
+  }
+  workingHostIpCache.set(hostname, { ip, cachedAt: Date.now() });
+}
+
+let updateCheckInterval = null;
 
 function sanitizeCustomHeaders(rawHeaders) {
   if (!rawHeaders || typeof rawHeaders !== 'object') return {};
@@ -433,7 +458,7 @@ let isInterceptionEnabled = true;
 let interceptedExtensions = ['zip', 'rar', '7z', 'exe', 'msi', 'dmg', 'pkg', 'deb', 'sh', 'apk', 'iso', 'bin', 'tar', 'gz', 'bz2', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'mp4', 'mkv', 'avi', 'mov', 'wmv', 'mp3', 'wav', 'flac', 'm4a'];
 let startWithWindows = false; // Persisted to config.json; used to reliably track startup state
 
-let extensionVersion = '1.0.8'; // Fallback
+let extensionVersion = '1.0.9'; // Fallback
 let lastSeenExtensionVersion = '';
 let lastExportedExtensionDir = '';
 
@@ -633,7 +658,8 @@ function createWindow() {
     // Check for updates 5s after window is ready (non-blocking)
     setTimeout(checkForUpdates, 5000);
     // Re-check every 30 minutes while app is running
-    setInterval(checkForUpdates, 30 * 60 * 1000);
+    if (updateCheckInterval) clearInterval(updateCheckInterval);
+    updateCheckInterval = setInterval(checkForUpdates, 30 * 60 * 1000);
   });
 
   mainWindow.setMenuBarVisibility(false);
@@ -1124,9 +1150,32 @@ app.on('window-all-closed', () => {
 });
 
 app.on('will-quit', () => {
-  if (server) {
-    server.close();
+  if (updateCheckInterval) {
+    clearInterval(updateCheckInterval);
+    updateCheckInterval = null;
   }
+  cancelAppUpdate();
+
+  for (const id of Object.keys(activeDownloads)) {
+    try {
+      activeDownloads[id].cleanup();
+    } catch {
+      // Ignore task cleanup error on exit
+    }
+    delete activeDownloads[id];
+  }
+
+  if (server) {
+    try {
+      server.close();
+    } catch {
+      // Ignore server close error
+    }
+    server = null;
+  }
+
+  try { httpAgent.destroy(); } catch {}
+  try { httpsAgent.destroy(); } catch {}
 });
 
 function normalizeGoogleDriveUrl(url) {
@@ -2834,7 +2883,7 @@ class DownloadTask {
       throw e;
     }
 
-    const cachedIp = !forcedIp ? workingHostIpCache.get(parsed.hostname) : null;
+    const cachedIp = !forcedIp ? getCachedWorkingHostIp(parsed.hostname) : null;
     const effectiveIp = forcedIp || cachedIp || null;
 
     try {
@@ -2944,14 +2993,14 @@ class DownloadTask {
       });
 
       if (effectiveIp && parsed.hostname) {
-        workingHostIpCache.set(parsed.hostname, effectiveIp);
+        setCachedWorkingHostIp(parsed.hostname, effectiveIp);
       }
       return result;
     } catch (err) {
       if (this.hlsAborted || this.status !== 'downloading') {
         throw err;
       }
-      if (cachedIp && workingHostIpCache.get(parsed.hostname) === cachedIp) {
+      if (cachedIp && getCachedWorkingHostIp(parsed.hostname) === cachedIp) {
         workingHostIpCache.delete(parsed.hostname);
       }
 
@@ -2978,7 +3027,7 @@ class DownloadTask {
             console.warn(`[HLS] Retrying ${parsed.hostname} via alternate DNS IP ${altIp} (failed: ${failedIp || errCode || errMsg})`);
             try {
               const altRes = await this.fetchBuffer(targetUrl, extraHeaders, redirectCount, altIp);
-              workingHostIpCache.set(parsed.hostname, altIp);
+              setCachedWorkingHostIp(parsed.hostname, altIp);
               return altRes;
             } catch (altErr) {
               console.warn(`[HLS] Alternate IP ${altIp} failed for ${parsed.hostname}: ${altErr.message}`);
@@ -3741,6 +3790,9 @@ class DownloadTask {
     this.statusNote = '';
     this.cleanup();
     this.sendProgress();
+    if (activeDownloads[this.id] === this) {
+      delete activeDownloads[this.id];
+    }
   }
 
   cleanup() {
@@ -3792,24 +3844,39 @@ class DownloadTask {
     this.statusNote = '';
     this.cleanup();
     this.sendProgress();
+    if (activeDownloads[this.id] === this) {
+      delete activeDownloads[this.id];
+    }
   }
 
-  handleError(err) {
-    console.error(`Download error for item ${this.id}:`, err);
+  async writeErrorLogAsync(err) {
     try {
       const logDir = app.getPath('userData');
       const logFile = path.join(logDir, 'download_error_debug.log');
       const time = new Date().toISOString();
       const logMessage = `[${time}] ID: ${this.id} | URL: ${this.url} | File: ${this.fileName}\nError: ${err.stack || err.message || err}\n\n`;
-      fs.appendFileSync(logFile, logMessage);
+      const stat = await fs.promises.stat(logFile).catch(() => null);
+      if (stat && stat.size > 2 * 1024 * 1024) {
+        await fs.promises.writeFile(logFile, logMessage, 'utf8');
+      } else {
+        await fs.promises.appendFile(logFile, logMessage, 'utf8');
+      }
     } catch (e) {
       console.error('Failed to write download error log:', e);
     }
+  }
+
+  handleError(err) {
+    console.error(`Download error for item ${this.id}:`, err);
+    this.writeErrorLogAsync(err);
     this.status = 'failed';
     this.statusNote = '';
     this.errorMsg = err.message || String(err);
     this.cleanup();
     this.sendProgress();
+    if (activeDownloads[this.id] === this) {
+      delete activeDownloads[this.id];
+    }
   }
 
   startSpeedTracker() {
@@ -3834,7 +3901,7 @@ class DownloadTask {
     }
     this.lastProgressSentTime = now;
 
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('download-progress', {
         id: this.id,
         downloaded: this.downloaded,

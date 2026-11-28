@@ -293,9 +293,9 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState({ percent: 0, transferred: 0, total: 0, speed: 0 });
   const [updateError, setUpdateError] = useState('');
   const [updateFeedback, setUpdateFeedback] = useState(null);
-  const [appVersion, setAppVersion] = useState('1.0.8');
+  const [appVersion, setAppVersion] = useState('1.0.9');
   const [extensionStatus, setExtensionStatus] = useState({
-    bundledVersion: '1.0.8',
+    bundledVersion: '1.0.9',
     installedVersion: 'Chưa nhận diện',
     detectedPath: '',
     needsUpdate: false

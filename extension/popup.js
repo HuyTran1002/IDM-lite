@@ -16,7 +16,7 @@ document.addEventListener('DOMContentLoaded', () => {
     feedbackEl.className = `feedback ${isError ? 'err' : 'ok'}`;
   }
 
-  function formatBytes(bytes) {
+  function formatBytes(bytes, isEstimated = false) {
     if (!bytes || bytes <= 0) return 'Stream';
     const units = ['B', 'KB', 'MB', 'GB'];
     let i = 0;
@@ -25,7 +25,18 @@ document.addEventListener('DOMContentLoaded', () => {
       val /= 1024;
       i++;
     }
-    return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    return `${isEstimated ? '~' : ''}${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+  }
+
+  function formatDuration(sec) {
+    if (!sec || !Number.isFinite(sec) || sec <= 0) return '';
+    const total = Math.round(sec);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    if (m > 0) return `${m}:${String(s).padStart(2, '0')}`;
+    return `${s}s`;
   }
 
   const PLATFORM_HOSTS = [
@@ -53,7 +64,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function sendDownloadRequest(payload) {
-    chrome.runtime.sendMessage({ type: 'IDMLITE_DOWNLOAD_VIDEO', ...payload }, (res) => {
+    chrome.runtime.sendMessage({ type: 'IDMLITE_DOWNLOAD_VIDEO', tabId: activeTab?.id, ...payload }, (res) => {
       if (chrome.runtime.lastError) {
         showFeedback('Lỗi giao tiếp extension.', true);
         return;
@@ -98,10 +109,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const tag = document.createElement('span');
       tag.className = 'tag';
-      tag.textContent = item.quality || item.type.toUpperCase();
+      const isShortClip = item.duration > 0 && item.duration <= 45;
+      tag.textContent = isShortClip ? `Clip ${formatDuration(item.duration)}` : (item.quality || item.type.toUpperCase());
 
       const sizeSpan = document.createElement('span');
-      sizeSpan.textContent = `${item.type.toUpperCase()} • ${formatBytes(item.size)}`;
+      const durText = formatDuration(item.duration);
+      const sizeText = formatBytes(item.size, Boolean(item.isEstimatedSize));
+      const metaParts = [item.type.toUpperCase()];
+      if (durText) metaParts.push(durText);
+      metaParts.push(sizeText);
+      if (isShortClip) metaParts.push('Clip ngắn / QC');
+      sizeSpan.textContent = metaParts.join(' • ');
 
       meta.appendChild(tag);
       meta.appendChild(sizeSpan);

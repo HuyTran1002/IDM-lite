@@ -154,10 +154,85 @@
     return urls;
   }
 
+  const AD_HOST_KEYWORDS = [
+    'doubleclick.net',
+    'googlesyndication.com',
+    'googleadservices.com',
+    'imasdk.googleapis.com',
+    'exoclick.com',
+    'exosrv.com',
+    'realsrv.com',
+    'magsrv.com',
+    'tsyndicate.com',
+    'trafficjunky.net',
+    'traffichaus.com',
+    'juicyads.com',
+    'adsterra',
+    'hilltopads',
+    'clickadu',
+    'popads',
+    'spotxchange',
+    'springserve',
+    'jwpltx',
+    'stripchat',
+    'chaturbate',
+    'bongacams',
+    'livejasmin',
+    'cam4',
+    'myfreecams',
+    'jerkmate',
+    'xlovecam',
+    'adnxs.com',
+    'rubiconproject',
+    'pubmatic',
+    'openx.net',
+    'criteo',
+    'taboola',
+    'outbrain'
+  ];
+
+  function isAdNetworkUrl(urlStr) {
+    if (!urlStr || typeof urlStr !== 'string') return false;
+    try {
+      const parsed = new URL(urlStr);
+      const host = parsed.hostname.toLowerCase();
+      if (AD_HOST_KEYWORDS.some((kw) => host.includes(kw))) {
+        return true;
+      }
+      const pathAndQuery = `${parsed.pathname}${parsed.search}`.toLowerCase();
+      return /(^|[/_.-])(ads?|adserver|advert|preroll|midroll|postroll|vast|vpaid|promo|banner|sponsor|commercial)([/_.-]|$)/i.test(pathAndQuery);
+    } catch {
+      return false;
+    }
+  }
+
+  function isPreviewClipUrl(urlStr) {
+    if (!urlStr || typeof urlStr !== 'string') return false;
+    try {
+      const parsed = new URL(urlStr);
+      const pathAndQuery = `${parsed.pathname}${parsed.search}`.toLowerCase();
+      return /(^|[/_.-])(preview|trailer|teaser|sample)([/_.-]|$)/i.test(pathAndQuery);
+    } catch {
+      return false;
+    }
+  }
+
+  function formatDuration(sec) {
+    if (!sec || !Number.isFinite(sec) || sec <= 0) return '';
+    const total = Math.round(sec);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    if (m > 0) return `${m}:${String(s).padStart(2, '0')}`;
+    return `${s}s`;
+  }
+
   function isNoiseMediaUrl(urlStr) {
     if (!urlStr || !urlStr.startsWith('http')) return true;
     const lower = urlStr.toLowerCase();
     return (
+      isAdNetworkUrl(urlStr) ||
       lower.includes('googlevideo.com/videoplayback') ||
       lower.includes('bytestart=') ||
       /[?&]range=\d+-\d+/i.test(lower) ||
@@ -166,7 +241,7 @@
     );
   }
 
-  function inferStreamEntry(rawUrl, priorityBoost = 0) {
+  function inferStreamEntry(rawUrl, priorityBoost = 0, meta = {}) {
     if (!rawUrl || isNoiseMediaUrl(rawUrl)) return null;
     const lower = rawUrl.toLowerCase();
     const isHls = /\.m3u8(\?|$|#)/i.test(lower);
@@ -176,9 +251,12 @@
 
     const type = isHls ? 'hls' : (isDash ? 'dash' : 'direct');
     const ext = isHls || isDash ? 'mp4' : directMatch[1].toLowerCase();
-    const quality = isHls
-      ? (/(master|playlist|index)/i.test(lower) ? 'HLS Master' : 'HLS Stream')
-      : (isDash ? 'DASH Stream' : ext.toUpperCase());
+    const isMaster = isHls && /(master|playlist|index)/i.test(lower);
+    const heightMatch = meta.resolution ? String(meta.resolution).match(/x(\d+)/i) : null;
+    const resQuality = heightMatch ? `${heightMatch[1]}p` : '';
+    const quality = resQuality || (isHls
+      ? (isMaster ? 'HLS Master' : 'HLS Stream')
+      : (isDash ? 'DASH Stream' : ext.toUpperCase()));
 
     let fileName = `video.${ext}`;
     try {
@@ -191,16 +269,242 @@
       // Ignore
     }
 
+    const duration = Number(meta.duration) || 0;
+    const estimatedSize = Number(meta.estimatedSize) || 0;
+    let priority;
+    if (isPreviewClipUrl(rawUrl)) {
+      priority = 15;
+    } else if (duration > 0 && duration <= 45) {
+      priority = 20;
+    } else if (isHls) {
+      if (duration >= 300) {
+        priority = 160 + (isMaster ? 15 : 0) + priorityBoost;
+      } else {
+        priority = (isMaster ? 115 : 105) + priorityBoost;
+      }
+    } else if (isDash) {
+      priority = (duration >= 300 ? 155 : 100) + priorityBoost;
+    } else {
+      priority = 55 + priorityBoost;
+    }
+
     return {
       url: rawUrl,
       type,
       ext,
-      size: 0,
+      size: estimatedSize,
+      isEstimatedSize: Boolean(meta.isEstimatedSize && estimatedSize > 0),
+      duration,
+      bandwidth: Number(meta.bandwidth) || 0,
+      resolution: meta.resolution || '',
       quality,
       fileName,
-      priority: (isHls ? 95 : (isDash ? 80 : 85)) + priorityBoost,
+      priority,
       detectedAt: Date.now()
     };
+  }
+
+  function decodeBaseN(token, radix) {
+    const digits = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let value = 0;
+    for (let i = 0; i < token.length; i++) {
+      const idx = digits.indexOf(token[i]);
+      if (idx === -1 || idx >= radix) return NaN;
+      value = value * radix + idx;
+    }
+    return value;
+  }
+
+  const scannedScripts = new WeakSet();
+  const requestedPageProbes = new Set();
+  let lastPerfEntryCount = 0;
+
+  function readJsStringLiteral(sourceText, quoteIdx) {
+    const quote = sourceText[quoteIdx];
+    if (quote !== '\'' && quote !== '"') return null;
+    let out = '';
+    for (let i = quoteIdx + 1; i < sourceText.length; i++) {
+      const ch = sourceText[i];
+      if (ch === '\\') {
+        if (i + 1 >= sourceText.length) return null;
+        const next = sourceText[++i];
+        if (next === 'n') out += '\n';
+        else if (next === 'r') out += '\r';
+        else if (next === 't') out += '\t';
+        else if (next === 'x' && i + 2 < sourceText.length) {
+          const code = parseInt(sourceText.slice(i + 1, i + 3), 16);
+          if (!Number.isNaN(code)) {
+            out += String.fromCharCode(code);
+            i += 2;
+          } else {
+            out += 'x';
+          }
+        } else if (next === 'u' && i + 4 < sourceText.length) {
+          const code = parseInt(sourceText.slice(i + 1, i + 5), 16);
+          if (!Number.isNaN(code)) {
+            out += String.fromCharCode(code);
+            i += 4;
+          } else {
+            out += 'u';
+          }
+        } else {
+          out += next;
+        }
+      } else if (ch === quote) {
+        return { value: out, endIndex: i };
+      } else {
+        out += ch;
+      }
+    }
+    return null;
+  }
+
+  function skipWhitespace(str, idx) {
+    let pos = idx;
+    while (pos < str.length && /\s/.test(str[pos])) pos++;
+    return pos;
+  }
+
+  function unpackDeanEdwardsBlocks(sourceText) {
+    if (!sourceText || typeof sourceText !== 'string' || !sourceText.includes('eval')) {
+      return [];
+    }
+    const results = [];
+    const headerRegex = /eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[a-zA-Z_$][a-zA-Z0-9_$]*\s*\)/g;
+    let headerMatch;
+    while ((headerMatch = headerRegex.exec(sourceText)) !== null) {
+      try {
+        const searchStart = headerMatch.index + headerMatch[0].length;
+        const searchWindow = sourceText.slice(searchStart, searchStart + 1200);
+        const splitOffset = searchWindow.indexOf('}(');
+        const altOffset = splitOffset !== -1 ? splitOffset : searchWindow.search(/\}\s*\(/);
+        if (altOffset === -1) continue;
+
+        let pos = searchStart + altOffset + 1;
+        pos = skipWhitespace(sourceText, pos);
+        if (sourceText[pos] !== '(') continue;
+        pos = skipWhitespace(sourceText, pos + 1);
+
+        const payloadLit = readJsStringLiteral(sourceText, pos);
+        if (!payloadLit) continue;
+
+        pos = skipWhitespace(sourceText, payloadLit.endIndex + 1);
+        if (sourceText[pos] !== ',') continue;
+        pos = skipWhitespace(sourceText, pos + 1);
+
+        const radixMatch = sourceText.slice(pos, pos + 16).match(/^(\d+)\s*,\s*(\d+)\s*,/);
+        if (!radixMatch) continue;
+        const radix = parseInt(radixMatch[1], 10);
+        const count = parseInt(radixMatch[2], 10);
+        if (!radix || radix < 2 || radix > 62 || !count) continue;
+
+        pos = skipWhitespace(sourceText, pos + radixMatch[0].length);
+        const dictLit = readJsStringLiteral(sourceText, pos);
+        if (!dictLit) continue;
+
+        const afterDict = sourceText.slice(dictLit.endIndex + 1, dictLit.endIndex + 32);
+        if (!/^\s*\.split\s*\(\s*(['"])\|\1\s*\)/.test(afterDict)) continue;
+
+        const dict = dictLit.value.split('|');
+        const unpacked = payloadLit.value.replace(/\b[0-9a-zA-Z]+\b/g, (tok) => {
+          const idx = decodeBaseN(tok, radix);
+          if (!Number.isNaN(idx) && idx >= 0 && idx < dict.length && dict[idx]) {
+            return dict[idx];
+          }
+          return tok;
+        });
+        results.push(unpacked);
+        headerRegex.lastIndex = dictLit.endIndex + 1;
+      } catch {
+        // Ignore malformed packed script block
+      }
+    }
+    return results;
+  }
+
+  function mergeDiscoveredMedia(items) {
+    if (!Array.isArray(items) || items.length === 0) return;
+    const changedItems = [];
+    for (const item of items) {
+      if (!item || !item.url || isAdNetworkUrl(item.url)) continue;
+      const idx = sniffedMedia.findIndex((m) => m.url === item.url);
+      if (idx === -1) {
+        sniffedMedia.unshift(item);
+        changedItems.push(item);
+      } else {
+        const prev = sniffedMedia[idx];
+        const next = { ...prev };
+        let updated = false;
+        if ((item.duration || 0) > (prev.duration || 0)) {
+          next.duration = item.duration;
+          updated = true;
+        }
+        if ((item.size || 0) > (prev.size || 0)) {
+          next.size = item.size;
+          next.isEstimatedSize = Boolean(item.isEstimatedSize);
+          updated = true;
+        }
+        if ((item.bandwidth || 0) > (prev.bandwidth || 0)) {
+          next.bandwidth = item.bandwidth;
+          updated = true;
+        }
+        if (item.resolution && !prev.resolution) {
+          next.resolution = item.resolution;
+          updated = true;
+        }
+        if (item.quality && (/^HLS (Master|Stream)$/i.test(prev.quality || '') || !prev.quality) && !/^HLS (Master|Stream)$/i.test(item.quality)) {
+          next.quality = item.quality;
+          updated = true;
+        }
+        if (updated && item.priority !== undefined && item.priority !== prev.priority) {
+          next.priority = item.priority;
+        } else if ((item.priority || 0) > (prev.priority || 0)) {
+          next.priority = item.priority;
+          updated = true;
+        }
+        if (updated) {
+          sniffedMedia[idx] = next;
+          changedItems.push(next);
+        }
+      }
+    }
+    if (changedItems.length > 0) {
+      sniffedMedia.sort((a, b) => {
+        if ((b.priority || 0) !== (a.priority || 0)) return (b.priority || 0) - (a.priority || 0);
+        if ((b.size || 0) !== (a.size || 0)) return (b.size || 0) - (a.size || 0);
+        if ((b.duration || 0) !== (a.duration || 0)) return (b.duration || 0) - (a.duration || 0);
+        return (b.detectedAt || 0) - (a.detectedAt || 0);
+      });
+      if (isContextValid()) {
+        try {
+          chrome.runtime.sendMessage({ type: 'IDMLITE_REPORT_MEDIA', mediaList: changedItems }, () => {
+            if (chrome.runtime.lastError) {
+              // Ignore
+            }
+          });
+        } catch {
+          // Ignore
+        }
+      }
+      if (activeVideo && typeof wrapEl !== 'undefined' && wrapEl.classList.contains('visible')) {
+        updatePrimaryBadge();
+        if (isMenuOpen) renderDropdownMenu();
+      }
+    }
+  }
+
+  function requestPageHlsProbe(hlsUrl) {
+    if (!hlsUrl || requestedPageProbes.has(hlsUrl)) return;
+    if (requestedPageProbes.size >= 100) {
+      const oldest = requestedPageProbes.values().next().value;
+      if (oldest) requestedPageProbes.delete(oldest);
+    }
+    requestedPageProbes.add(hlsUrl);
+    try {
+      window.postMessage({ __idmliteProbeHls: true, url: hlsUrl }, '*');
+    } catch {
+      // Ignore postMessage failure
+    }
   }
 
   function discoverLocalPageStreams() {
@@ -214,15 +518,25 @@
       if (entry) {
         seen.add(rawUrl);
         found.push(entry);
+        if (entry.type === 'hls') {
+          requestPageHlsProbe(entry.url);
+        }
       }
     };
 
-    // 1. Performance resource entries (catches JWPlayer/HLS.js/Video.js cached or early requests)
+    // 1. New Performance resource entries only (incremental, skip timed-out/failed probes)
     try {
       const entries = performance.getEntriesByType('resource');
-      for (let i = entries.length - 1; i >= 0; i--) {
-        addCandidate(entries[i].name, 10);
+      if (entries.length < lastPerfEntryCount) {
+        lastPerfEntryCount = 0;
       }
+      for (let i = entries.length - 1; i >= lastPerfEntryCount; i--) {
+        const entry = entries[i];
+        if (!entry || entry.responseEnd <= 0) continue;
+        if (typeof entry.responseStatus === 'number' && entry.responseStatus >= 400) continue;
+        addCandidate(entry.name, 5);
+      }
+      lastPerfEntryCount = entries.length;
     } catch {
       // Ignore
     }
@@ -254,33 +568,86 @@
       // Ignore
     }
 
-    if (found.length > 0) {
-      let changed = false;
-      for (const item of found) {
-        if (!sniffedMedia.some((m) => m.url === item.url)) {
-          sniffedMedia.unshift(item);
-          changed = true;
+    // 3. New inline <script> elements only + linear-time Dean Edwards unpacker
+    try {
+      const streamUrlRegex = /(?:https?:)?\/\/[^\s"'<>\\`]+\.(?:m3u8|mpd)(?:\?[^\s"'<>\\`]*)?/gi;
+      const scripts = document.querySelectorAll('script:not([src])');
+      for (const script of scripts) {
+        if (scannedScripts.has(script)) continue;
+        scannedScripts.add(script);
+        const rawText = script.textContent || '';
+        if (!rawText || rawText.length > 300000) continue;
+        const unpackedBlocks = unpackDeanEdwardsBlocks(rawText);
+        const textsToScan = [...unpackedBlocks, rawText.replace(/\\\//g, '/')];
+        for (const text of textsToScan) {
+          const matches = text.match(streamUrlRegex);
+          if (!matches) continue;
+          for (const rawUrl of matches) {
+            let cleanUrl = rawUrl.replace(/&amp;/g, '&');
+            if (cleanUrl.startsWith('//')) cleanUrl = `${window.location.protocol}${cleanUrl}`;
+            const isMaster = /(master|playlist|index)\.m3u8/i.test(cleanUrl);
+            addCandidate(cleanUrl, isMaster ? 25 : 15);
+          }
         }
       }
-      if (changed) {
-        sniffedMedia.sort((a, b) => (b.priority || 0) - (a.priority || 0));
-        try {
-          chrome.runtime.sendMessage({ type: 'IDMLITE_REPORT_MEDIA', mediaList: found }, () => {
-            if (chrome.runtime.lastError) {
-              // Ignore
-            }
-          });
-        } catch {
-          // Ignore
-        }
-      }
+    } catch {
+      // Ignore inline script scan errors
     }
 
+    mergeDiscoveredMedia(found);
     return found;
   }
 
+  // Receive dynamically hooked stream URLs (fetch / XHR / player globals) from MAIN-world page_hook.js
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || !event.data || event.data.__idmliteStream !== true || !event.data.url) return;
+    const entry = inferStreamEntry(event.data.url, 22, event.data);
+    if (entry) {
+      mergeDiscoveredMedia([entry]);
+    }
+  });
+
+  // Track real <video> duration once loaded so short 22s preroll/midroll ads are immediately demoted
+  document.addEventListener(
+    'loadedmetadata',
+    (e) => {
+      const video = e.target;
+      if (!(video instanceof HTMLVideoElement)) return;
+      const src = video.currentSrc || video.src || '';
+      if (!src.startsWith('http')) return;
+      if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+      const entry = inferStreamEntry(src, 0, { duration: Math.round(video.duration) });
+      if (entry) {
+        mergeDiscoveredMedia([entry]);
+      }
+    },
+    true
+  );
+
   // Create neutral custom-tag Shadow DOM host immune to adblock/WebShield overlay heuristics
+  const INSTANCE_ID = `idm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  let isDisposed = false;
+  let hostObserver = null;
+  let parentObserver = null;
+  let watchdogInterval = null;
+
+  try {
+    document.querySelectorAll('idm-ext-ui').forEach((el) => {
+      try {
+        el.remove();
+      } catch {
+        // Ignore stale host removal errors
+      }
+    });
+    if (document.documentElement) {
+      document.documentElement.dataset.idmActiveInstance = INSTANCE_ID;
+    }
+  } catch {
+    // Ignore DOM cleanup errors
+  }
+
   const host = document.createElement('idm-ext-ui');
+  host.dataset.idmInstance = INSTANCE_ID;
   host.setAttribute('style', HOST_CSS);
   const shadow = host.attachShadow({ mode: 'closed' });
 
@@ -496,7 +863,71 @@
     </div>
   `;
 
+  function isInstanceActive() {
+    if (isDisposed) return false;
+    try {
+      if (document.documentElement && document.documentElement.dataset.idmActiveInstance !== INSTANCE_ID) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    return isContextValid();
+  }
+
+  function disposeInstance() {
+    if (isDisposed) return;
+    isDisposed = true;
+    if (watchdogInterval) {
+      clearInterval(watchdogInterval);
+      watchdogInterval = null;
+    }
+    clearHideTimers();
+    try {
+      if (hostObserver) hostObserver.disconnect();
+    } catch {
+      // Ignore
+    }
+    try {
+      if (parentObserver) parentObserver.disconnect();
+    } catch {
+      // Ignore
+    }
+    try {
+      document.removeEventListener('fullscreenchange', ensureHostIntegrity);
+    } catch {
+      // Ignore
+    }
+    try {
+      host.remove();
+    } catch {
+      // Ignore
+    }
+    try {
+      window.__idmliteContentLoaded = false;
+    } catch {
+      // Ignore
+    }
+  }
+
   function ensureHostIntegrity() {
+    if (!isInstanceActive()) {
+      disposeInstance();
+      return;
+    }
+    try {
+      document.querySelectorAll('idm-ext-ui').forEach((el) => {
+        if (el !== host && el.dataset?.idmInstance !== INSTANCE_ID) {
+          try {
+            el.remove();
+          } catch {
+            // Ignore foreign host removal errors
+          }
+        }
+      });
+    } catch {
+      // Ignore DOM scan errors
+    }
     const targetParent = document.fullscreenElement || document.documentElement;
     if (targetParent && host.parentElement !== targetParent) {
       targetParent.appendChild(host);
@@ -514,7 +945,7 @@
 
   // Self-heal if WebShield / adblocker / page scripts hide or detach our host element
   try {
-    const hostObserver = new MutationObserver(() => {
+    hostObserver = new MutationObserver(() => {
       ensureHostIntegrity();
     });
     hostObserver.observe(host, {
@@ -522,7 +953,11 @@
       attributeFilter: ['style', 'hidden', 'class']
     });
 
-    const parentObserver = new MutationObserver(() => {
+    parentObserver = new MutationObserver(() => {
+      if (!isInstanceActive()) {
+        disposeInstance();
+        return;
+      }
       if (!host.isConnected) {
         ensureHostIntegrity();
       }
@@ -553,46 +988,90 @@
   }
 
   function buildCandidateOptions(video) {
-    discoverLocalPageStreams();
     const permalink = findClosestVideoPermalink(video);
     const title = extractVideoTitle(video);
     const directUrls = getDirectVideoUrls(video);
     const isPlatform = isMajorVideoPlatform(permalink);
+    const isYouTube = /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(window.location.hostname);
     const options = [];
+    const streamCandidates = [];
+    const videoDur = video && Number.isFinite(video.duration) && video.duration > 0 ? Math.round(video.duration) : 0;
 
     if (!isPlatform) {
       directUrls.forEach((u, idx) => {
+        if (isAdNetworkUrl(u)) return;
         const isHls = /\.m3u8(\?|$|#)/i.test(u);
         const ext = isHls ? 'mp4' : (u.match(/\.(mp4|webm|mkv|mov|flv)(\?|$)/i)?.[1]?.toLowerCase() || 'mp4');
-        options.push({
-          group: 'stream',
-          label: idx === 0 ? `Video trực tiếp (${ext.toUpperCase()})` : `Nguồn video #${idx + 1} (${ext.toUpperCase()})`,
-          tag: isHls ? 'HLS' : ext.toUpperCase(),
+        const isShort = isPreviewClipUrl(u) || (videoDur > 0 && videoDur <= 45);
+        const priority = isPreviewClipUrl(u) ? 15 : (isShort ? 20 : (isHls ? 105 : 65));
+        streamCandidates.push({
+          label: idx === 0 ? `Video trên trang (${ext.toUpperCase()})` : `Nguồn video #${idx + 1} (${ext.toUpperCase()})`,
+          tag: isShort && videoDur > 0 ? `Clip ${formatDuration(videoDur)}` : (isHls ? 'HLS' : ext.toUpperCase()),
           url: u,
           pageUrl: permalink,
           videoType: isHls ? 'hls' : 'direct',
           quality: 'best',
-          fileName: `${title}.${ext}`
+          fileName: `${title}.${ext}`,
+          priority,
+          size: 0,
+          isEstimatedSize: false,
+          duration: videoDur
         });
       });
     }
 
-    const isYouTube = /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(window.location.hostname);
     if (!isYouTube) {
       for (const m of sniffedMedia) {
-        if (options.some((o) => o.url === m.url)) continue;
-        const sizeLabel = m.size ? ` (${formatBytes(m.size)})` : '';
-        options.push({
-          group: 'stream',
-          label: `${m.fileName || 'Stream'}${sizeLabel}`,
-          tag: m.quality || m.type.toUpperCase(),
+        if (!m || !m.url || isAdNetworkUrl(m.url)) continue;
+        const cand = {
+          label: m.fileName || 'Stream',
+          tag: (m.duration > 0 && m.duration <= 45) ? `Clip ${formatDuration(m.duration)}` : (m.quality || m.type.toUpperCase()),
           url: m.url,
           pageUrl: permalink,
           videoType: m.type,
           quality: 'best',
-          fileName: `${title}.${m.ext || 'mp4'}`
-        });
+          fileName: `${title}.${m.ext || 'mp4'}`,
+          priority: Number(m.priority) || 50,
+          size: Number(m.size) || 0,
+          isEstimatedSize: Boolean(m.isEstimatedSize),
+          duration: Number(m.duration) || 0
+        };
+        const existingIdx = streamCandidates.findIndex((c) => c.url === m.url);
+        if (existingIdx !== -1) {
+          if (
+            cand.priority >= streamCandidates[existingIdx].priority ||
+            cand.size > streamCandidates[existingIdx].size ||
+            cand.duration > streamCandidates[existingIdx].duration
+          ) {
+            streamCandidates[existingIdx] = cand;
+          }
+        } else {
+          streamCandidates.push(cand);
+        }
       }
+    }
+
+    streamCandidates.sort((a, b) => {
+      if ((b.priority || 0) !== (a.priority || 0)) return (b.priority || 0) - (a.priority || 0);
+      if ((b.size || 0) !== (a.size || 0)) return (b.size || 0) - (a.size || 0);
+      return (b.duration || 0) - (a.duration || 0);
+    });
+
+    for (const c of streamCandidates) {
+      const durText = formatDuration(c.duration);
+      const sizeText = c.size > 0 ? `${c.isEstimatedSize ? '~' : ''}${formatBytes(c.size)}` : '';
+      const shortNote = c.duration > 0 && c.duration <= 45 ? 'Clip ngắn / QC' : '';
+      const details = [durText, sizeText, shortNote].filter(Boolean).join(' • ');
+      options.push({
+        group: 'stream',
+        label: details ? `${c.label} (${details})` : c.label,
+        tag: c.tag,
+        url: c.url,
+        pageUrl: c.pageUrl,
+        videoType: c.videoType,
+        quality: c.quality,
+        fileName: c.fileName
+      });
     }
 
     const primaryStream = !isPlatform && options.length > 0 ? options[0] : null;
@@ -622,31 +1101,122 @@
     return options;
   }
 
-  function triggerDownload(option) {
-    showToast('⏳ Đang gửi tới IDM Lite...');
-    chrome.runtime.sendMessage(
-      {
-        type: 'IDMLITE_DOWNLOAD_VIDEO',
-        url: option.url,
-        pageUrl: option.pageUrl,
-        title: extractVideoTitle(activeVideo),
-        fileName: option.fileName,
-        videoType: option.videoType,
-        quality: option.quality,
-        referrer: window.location.href
-      },
-      (res) => {
-        if (chrome.runtime.lastError) {
-          showToast('⚠ Lỗi giao tiếp extension', true);
-          return;
-        }
-        if (res && res.success) {
-          showToast('✓ Đã mở hộp thoại tải IDM Lite!');
-        } else {
-          showToast(`⚠ ${res?.error || 'Hãy bật ứng dụng IDM Lite'}`, true);
+  function isContextValid() {
+    try {
+      return Boolean(typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id);
+    } catch {
+      return false;
+    }
+  }
+
+  function extractPageCdnHeaders() {
+    const headers = {};
+    try {
+      const cdnCfg = document.getElementById('cdn-config');
+      if (cdnCfg && cdnCfg.dataset) {
+        const m3u8Enabled = cdnCfg.dataset.video_m3u8_cdn_enabled === '1';
+        const otherEnabled = cdnCfg.dataset.video_other_cdn_enabled === '1';
+        const authKey = (cdnCfg.dataset.video_cdn_auth_key || '').trim();
+        const authVal = (cdnCfg.dataset.video_cdn_auth_value || '').trim();
+        const cdnApp = (cdnCfg.dataset.cdn_app || '').trim();
+        if ((m3u8Enabled || otherEnabled) && authKey && authVal) {
+          headers[authKey] = authVal;
+          if (cdnApp) {
+            headers['x-cdn-app'] = cdnApp;
+          }
         }
       }
-    );
+    } catch {
+      // Ignore DOM access errors
+    }
+    return headers;
+  }
+
+  function sendDownloadDirectlyToApp(payload) {
+    return fetch('http://127.0.0.1:9091/add-download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: payload.url,
+        pageUrl: payload.pageUrl,
+        fileName: payload.fileName,
+        title: payload.title,
+        referrer: payload.referrer,
+        userAgent: navigator.userAgent || '',
+        isVideo: true,
+        videoType: payload.videoType || 'auto',
+        quality: payload.quality || 'best',
+        customHeaders: payload.customHeaders || {}
+      })
+    }).then((res) => res.json().catch(() => ({})));
+  }
+
+  function triggerDownload(option) {
+    showToast('⏳ Đang gửi tới IDM Lite...');
+    const payload = {
+      type: 'IDMLITE_DOWNLOAD_VIDEO',
+      url: option.url,
+      pageUrl: option.pageUrl,
+      title: extractVideoTitle(activeVideo),
+      fileName: option.fileName,
+      videoType: option.videoType,
+      quality: option.quality,
+      referrer: window.location.href,
+      customHeaders: extractPageCdnHeaders()
+    };
+
+    if (!isContextValid()) {
+      sendDownloadDirectlyToApp(payload)
+        .then((data) => {
+          if (data && data.success) {
+            showToast('✓ Đã mở hộp thoại tải IDM Lite!');
+          } else {
+            showToast('⚠ Extension vừa cập nhật — hãy tải lại trang (F5) nếu thiếu cookie/header', true);
+          }
+        })
+        .catch(() => {
+          showToast('⚠ Extension vừa cập nhật — hãy F5 trang hoặc bật IDM Lite', true);
+        });
+      return;
+    }
+
+    try {
+      chrome.runtime.sendMessage(payload, (res) => {
+        try {
+          if (chrome.runtime.lastError) {
+            sendDownloadDirectlyToApp(payload)
+              .then((data) => {
+                if (data && data.success) {
+                  showToast('✓ Đã mở hộp thoại tải IDM Lite!');
+                } else {
+                  showToast('⚠ Lỗi giao tiếp extension', true);
+                }
+              })
+              .catch(() => showToast('⚠ Lỗi giao tiếp extension', true));
+            return;
+          }
+          if (res && res.success) {
+            showToast('✓ Đã mở hộp thoại tải IDM Lite!');
+          } else {
+            showToast(`⚠ ${res?.error || 'Hãy bật ứng dụng IDM Lite'}`, true);
+          }
+        } catch {
+          showToast('⚠ Lỗi giao tiếp extension — thử F5 lại trang', true);
+        }
+      });
+    } catch {
+      sendDownloadDirectlyToApp(payload)
+        .then((data) => {
+          if (data && data.success) {
+            showToast('✓ Đã mở hộp thoại tải IDM Lite!');
+          } else {
+            showToast('⚠ Extension vừa cập nhật — hãy tải lại trang (F5)', true);
+          }
+        })
+        .catch(() => {
+          showToast('⚠ Extension vừa cập nhật — hãy F5 lại trang', true);
+        });
+    }
   }
 
   function renderDropdownMenu() {
@@ -717,16 +1287,43 @@
     }
   }
 
+  function getPlayerTargetRect(video) {
+    if (!(video instanceof HTMLVideoElement) || !video.isConnected) return null;
+    const rect = video.getBoundingClientRect();
+    const style = window.getComputedStyle(video);
+    if (
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      style.opacity !== '0' &&
+      rect.width >= 160 &&
+      rect.height >= 90
+    ) {
+      return rect;
+    }
+
+    const container = video.closest('.plyr, .video-js, .dplayer, .artplayer-app, .jwplayer, [class*="player"]');
+    if (container && container instanceof HTMLElement) {
+      const cStyle = window.getComputedStyle(container);
+      const cRect = container.getBoundingClientRect();
+      if (
+        cStyle.display !== 'none' &&
+        cStyle.visibility !== 'hidden' &&
+        cStyle.opacity !== '0' &&
+        cRect.width >= 160 &&
+        cRect.height >= 90
+      ) {
+        return cRect;
+      }
+    }
+    return null;
+  }
+
   function isEligibleVideo(video) {
     if (!(video instanceof HTMLVideoElement) || !video.isConnected) return false;
     if (dismissedVideos.has(video)) return false;
-    const rect = video.getBoundingClientRect();
-    if (rect.width < 160 || rect.height < 90) return false;
+    const rect = getPlayerTargetRect(video);
+    if (!rect) return false;
     if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) {
-      return false;
-    }
-    const style = window.getComputedStyle(video);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
       return false;
     }
     return true;
@@ -748,8 +1345,9 @@
     let bestVideo = null;
     let bestArea = 0;
     for (const v of videos) {
-      if (!isEligibleVideo(v)) continue;
-      const r = v.getBoundingClientRect();
+      if (dismissedVideos.has(v)) continue;
+      const r = getPlayerTargetRect(v);
+      if (!r || r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
         const area = r.width * r.height;
         if (area >= bestArea) {
@@ -763,7 +1361,7 @@
 
   function isPointOverFloatingUI(x, y) {
     if (!wrapEl.classList.contains('visible')) return false;
-    const pad = 8;
+    const pad = 14;
     const barRect = barEl.getBoundingClientRect();
     if (
       barRect.width > 0 &&
@@ -797,7 +1395,7 @@
     activeVideo = null;
   }
 
-  function scheduleLeaveHide(delay = 350) {
+  function scheduleLeaveHide(delay = 450) {
     if (leaveHideTimer) clearTimeout(leaveHideTimer);
     leaveHideTimer = setTimeout(() => {
       leaveHideTimer = null;
@@ -818,7 +1416,8 @@
   }
 
   function positionWrapForVideo(video) {
-    if (!isEligibleVideo(video)) {
+    const rect = getPlayerTargetRect(video);
+    if (!rect || dismissedVideos.has(video) || rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) {
       activeVideo = null;
       isPointerInsideBar = false;
       isMenuOpen = false;
@@ -828,18 +1427,33 @@
       return;
     }
 
-    const rect = video.getBoundingClientRect();
-    const top = Math.max(8, Math.min(window.innerHeight - 44, rect.top + 10));
-    const right = Math.max(8, Math.min(window.innerWidth - 190, window.innerWidth - rect.right + 10));
+    const barHeight = barEl.offsetHeight || 34;
+    const gap = 6;
+    let top;
+    if (rect.top - barHeight - gap >= 6) {
+      top = rect.top - barHeight - gap;
+    } else if (rect.bottom + gap + barHeight <= window.innerHeight - 6) {
+      top = rect.bottom + gap;
+    } else {
+      top = Math.max(8, rect.top + 8);
+    }
+
+    const right = Math.max(8, Math.min(window.innerWidth - 190, window.innerWidth - rect.right));
+    wrapEl.style.flexDirection = (top + barHeight + 220 > window.innerHeight && top > 240) ? 'column-reverse' : 'column';
     wrapEl.style.top = `${Math.round(top)}px`;
     wrapEl.style.right = `${Math.round(right)}px`;
   }
 
   function showFloatingBar(video) {
+    if (!isInstanceActive()) {
+      disposeInstance();
+      return;
+    }
     if (!isEligibleVideo(video)) return;
     const isNewVideo = activeVideo !== video || !wrapEl.classList.contains('visible');
     activeVideo = video;
     ensureHostIntegrity();
+    if (isDisposed) return;
     if (isNewVideo) {
       updatePrimaryBadge();
     }
@@ -927,6 +1541,10 @@
   document.addEventListener(
     'mousemove',
     (e) => {
+      if (!isInstanceActive()) {
+        disposeInstance();
+        return;
+      }
       const now = Date.now();
       if (now - lastMouseMoveTime < 80) return;
       lastMouseMoveTime = now;
@@ -940,7 +1558,7 @@
       if (hoveredVideo) {
         showFloatingBar(hoveredVideo);
       } else if (wrapEl.classList.contains('visible')) {
-        scheduleLeaveHide(350);
+        scheduleLeaveHide(450);
       }
     },
     { capture: true, passive: true }
@@ -980,8 +1598,13 @@
 
   // 500ms watchdog: keep host intact against WebShield/adblockers and track visible bar position
   let watchdogTick = 0;
-  setInterval(() => {
+  watchdogInterval = setInterval(() => {
+    if (!isInstanceActive()) {
+      disposeInstance();
+      return;
+    }
     ensureHostIntegrity();
+    if (isDisposed) return;
     watchdogTick++;
     if (watchdogTick % 3 === 0) {
       const prevCount = sniffedMedia.length;
@@ -1004,27 +1627,33 @@
   discoverLocalPageStreams();
 
   // Sync sniffed streams from background service worker
-  try {
-    chrome.runtime.sendMessage({ type: 'IDMLITE_GET_TAB_MEDIA' }, (res) => {
-      if (chrome.runtime.lastError) return;
-      if (res && Array.isArray(res.mediaList)) {
-        sniffedMedia = res.mediaList;
-        if (activeVideo && wrapEl.classList.contains('visible')) {
-          updatePrimaryBadge();
+  if (isContextValid()) {
+    try {
+      chrome.runtime.sendMessage({ type: 'IDMLITE_GET_TAB_MEDIA' }, (res) => {
+        try {
+          if (chrome.runtime.lastError) return;
+          if (res && Array.isArray(res.mediaList)) {
+            sniffedMedia = res.mediaList;
+            if (activeVideo && wrapEl.classList.contains('visible')) {
+              updatePrimaryBadge();
+            }
+          }
+        } catch {
+          // Ignore extension context invalidation
         }
-      }
-    });
+      });
 
-    chrome.runtime.onMessage.addListener((msg) => {
-      if (msg && msg.type === 'IDMLITE_MEDIA_UPDATED' && Array.isArray(msg.mediaList)) {
-        sniffedMedia = msg.mediaList;
-        if (activeVideo && wrapEl.classList.contains('visible')) {
-          updatePrimaryBadge();
-          if (isMenuOpen) renderDropdownMenu();
+      chrome.runtime.onMessage.addListener((msg) => {
+        if (msg && msg.type === 'IDMLITE_MEDIA_UPDATED' && Array.isArray(msg.mediaList)) {
+          sniffedMedia = msg.mediaList;
+          if (activeVideo && wrapEl.classList.contains('visible')) {
+            updatePrimaryBadge();
+            if (isMenuOpen) renderDropdownMenu();
+          }
         }
-      }
-    });
-  } catch {
-    // Ignore extension context invalidation
+      });
+    } catch {
+      // Ignore extension context invalidation
+    }
   }
 })();

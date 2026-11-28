@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, Menu, Tray, dialog, session } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Menu, Tray, dialog, session, net, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
@@ -6,6 +6,7 @@ const http = require('http');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
+const dns = require('dns');
 
 // ── Single instance lock ─────────────────────────────────────────────────────
 // Prevent multiple instances from running and competing on port 9091
@@ -41,6 +42,100 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 128, keepAlive
 
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36';
 
+// Cache working IPv4 addresses for CDN hostnames that suffer ISP/default-DNS blackholes
+const workingHostIpCache = new Map();
+
+function sanitizeCustomHeaders(rawHeaders) {
+  if (!rawHeaders || typeof rawHeaders !== 'object') return {};
+  const cleaned = {};
+  for (const [k, v] of Object.entries(rawHeaders)) {
+    if (!k || typeof v !== 'string' || !v.trim()) continue;
+    const lower = String(k).trim().toLowerCase();
+    if (['host', 'content-length', 'connection', 'accept-encoding'].includes(lower)) continue;
+    cleaned[String(k).trim()] = v;
+  }
+  return cleaned;
+}
+
+function extractFailedIpFromError(err) {
+  const msg = `${err?.code || ''} ${err?.message || ''} ${err?.address || ''}`;
+  const match = msg.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/);
+  return match ? match[1] : null;
+}
+
+async function resolveAlternateIps(hostname) {
+  if (!hostname || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return [];
+  const ips = [];
+  const addIp = (ip) => {
+    if (ip && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip) && !ips.includes(ip)) {
+      ips.push(ip);
+    }
+  };
+
+  // Query public DNS resolvers directly via UDP/TCP
+  const serverGroups = [
+    ['8.8.8.8', '8.8.4.4'],
+    ['1.1.1.1', '1.0.0.1']
+  ];
+  await Promise.all(
+    serverGroups.map(
+      (servers) =>
+        new Promise((resolve) => {
+          try {
+            const resolver = new dns.Resolver();
+            resolver.setServers(servers);
+            const timer = setTimeout(() => resolve(), 3000);
+            resolver.resolve4(hostname, (err, addresses) => {
+              clearTimeout(timer);
+              if (!err && Array.isArray(addresses)) {
+                addresses.forEach(addIp);
+              }
+              resolve();
+            });
+          } catch {
+            resolve();
+          }
+        })
+    )
+  );
+
+  // Fallback to Google DNS-over-HTTPS when UDP port 53 is hijacked/filtered
+  if (ips.length === 0) {
+    try {
+      const dohRes = await new Promise((resolve) => {
+        const req = https.get(
+          `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`,
+          { timeout: 3500, headers: { Accept: 'application/dns-json' } },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+              try {
+                resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+              } catch {
+                resolve(null);
+              }
+            });
+          }
+        );
+        req.on('timeout', () => req.destroy());
+        req.on('error', () => resolve(null));
+      });
+      if (dohRes && Array.isArray(dohRes.Answer)) {
+        for (const ans of dohRes.Answer) {
+          if (ans && ans.type === 1 && ans.data) {
+            addIp(String(ans.data).trim());
+          }
+        }
+      }
+    } catch {
+      // Ignore DoH failures
+    }
+  }
+
+  return ips;
+}
+
 function buildStandardHeaders(options = {}) {
   const headers = {
     'User-Agent': options.userAgent || DEFAULT_USER_AGENT,
@@ -66,6 +161,12 @@ function buildStandardHeaders(options = {}) {
   if (options.referrer) {
     headers['Referer'] = options.referrer;
   }
+  if (options.customHeaders && typeof options.customHeaders === 'object') {
+    const cleanCustom = sanitizeCustomHeaders(options.customHeaders);
+    for (const [k, v] of Object.entries(cleanCustom)) {
+      headers[k] = v;
+    }
+  }
   return headers;
 }
 
@@ -86,6 +187,8 @@ function isNewerVersion(latest, current) {
   }
   return false;
 }
+
+let pendingUpdateInfo = null;
 
 /** Fetch latest release from GitHub and notify renderer if update is available. */
 async function checkForUpdates(isManual = false) {
@@ -112,18 +215,39 @@ async function checkForUpdates(isManual = false) {
       const assetSize = exeAsset ? exeAsset.size : 0;
       const assetName = exeAsset ? exeAsset.name : `IDMLite.Setup.${latestVersion}.exe`;
 
+      const updatePayload = {
+        currentVersion,
+        latestVersion,
+        releaseNotes: data.body || '',
+        releaseUrl: data.html_url || GITHUB_RELEASES_URL,
+        downloadUrl,
+        assetName,
+        assetSize
+      };
+      pendingUpdateInfo = updatePayload;
+
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('update-available', {
-          currentVersion,
-          latestVersion,
-          releaseNotes: data.body || '',
-          releaseUrl: data.html_url || GITHUB_RELEASES_URL,
-          downloadUrl,
-          assetName,
-          assetSize
-        });
+        mainWindow.webContents.send('update-available', updatePayload);
+        if (!mainWindow.isVisible() && Notification.isSupported()) {
+          try {
+            const notif = new Notification({
+              title: `IDM Lite đã có bản mới v${latestVersion}`,
+              body: `Hiện tại: v${currentVersion}. Nhấn để mở và cập nhật.`
+            });
+            notif.on('click', () => {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                if (mainWindow.isMinimized()) mainWindow.restore();
+                mainWindow.show();
+                mainWindow.focus();
+                mainWindow.webContents.send('update-available', updatePayload);
+              }
+            });
+            notif.show();
+          } catch (e) { }
+        }
       }
     } else {
+      pendingUpdateInfo = null;
       console.log(`[Update] App is up to date (v${currentVersion}).`);
       if (isManual && mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('update-not-available', { currentVersion });
@@ -180,6 +304,7 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
       if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
         let redirectUrl = res.headers.location;
         if (redirectUrl) {
+          res.resume();
           try {
             redirectUrl = new URL(redirectUrl, curUrl).href;
           } catch (e) { }
@@ -188,6 +313,7 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
       }
 
       if (res.statusCode !== 200) {
+        res.resume();
         return onError(new Error(`Máy chủ tải cập nhật trả về mã lỗi: ${res.statusCode}`));
       }
 
@@ -196,14 +322,15 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
       let lastTransferred = 0;
       let speed = 0;
 
+      onProgress({ percent: 0, transferred: 0, total, speed: 0 });
       const fileStream = fs.createWriteStream(destPath);
 
       updateSpeedInterval = setInterval(() => {
-        speed = Math.max(0, transferred - lastTransferred) * 2;
+        speed = Math.max(0, transferred - lastTransferred) * 4;
         lastTransferred = transferred;
-        const percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
+        const percent = total > 0 ? Math.min(99, Math.round((transferred / total) * 100)) : 0;
         onProgress({ percent, transferred, total, speed });
-      }, 500);
+      }, 250);
 
       res.on('data', (chunk) => {
         transferred += chunk.length;
@@ -213,7 +340,10 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
 
       fileStream.on('finish', () => {
         if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+        updateSpeedInterval = null;
         activeUpdateReq = null;
+        const finalTotal = total > 0 ? total : transferred;
+        onProgress({ percent: 100, transferred: finalTotal, total: finalTotal, speed: 0 });
         fileStream.close(() => {
           onComplete(destPath);
         });
@@ -221,6 +351,7 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
 
       fileStream.on('error', (err) => {
         if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+        updateSpeedInterval = null;
         activeUpdateReq = null;
         try { fs.unlinkSync(destPath); } catch (e) { }
         onError(err);
@@ -228,6 +359,7 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
 
       res.on('error', (err) => {
         if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+        updateSpeedInterval = null;
         activeUpdateReq = null;
         fileStream.destroy();
         try { fs.unlinkSync(destPath); } catch (e) { }
@@ -237,6 +369,7 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
 
     req.on('error', (err) => {
       if (updateSpeedInterval) clearInterval(updateSpeedInterval);
+      updateSpeedInterval = null;
       activeUpdateReq = null;
       onError(err);
     });
@@ -248,26 +381,16 @@ function downloadUpdate(url, destPath, onProgress, onComplete, onError) {
 }
 
 function launchInstallerAndQuit(installerPath) {
-  const currentExe = process.execPath;
-  const isPackaged = app.isPackaged;
-
   const tempDir = path.dirname(installerPath);
   const batPath = path.join(tempDir, 'run_update.bat');
-
-  const relaunchCmd = isPackaged ? `start "" "${currentExe}"` : `echo Finished in dev mode`;
 
   const batContent = `@echo off
 chcp 65001 >nul
 echo [IDMLite Update] Dang chuan bi cai dat ban moi...
 timeout /t 2 /nobreak >nul
 taskkill /F /IM IDMLite.exe >nul 2>&1
-echo [IDMLite Update] Dang cai dat...
-start /wait "" "${installerPath}" /S
-if %errorlevel% neq 0 (
-  start /wait "" "${installerPath}"
-)
-echo [IDMLite Update] Khoi dong lai ung dung...
-${relaunchCmd}
+echo [IDMLite Update] Dang chay trinh cai dat...
+start "" "${installerPath}"
 exit
 `;
 
@@ -280,22 +403,18 @@ exit
     });
     child.unref();
 
-    setTimeout(() => {
-      app.isQuitting = true;
-      app.quit();
-    }, 600);
+    app.isQuitting = true;
+    app.quit();
   } catch (err) {
     console.error('Failed to launch update script:', err);
     try {
-      const child = spawn(installerPath, ['/S'], {
+      const child = spawn(installerPath, [], {
         detached: true,
         stdio: 'ignore'
       });
       child.unref();
-      setTimeout(() => {
-        app.isQuitting = true;
-        app.quit();
-      }, 600);
+      app.isQuitting = true;
+      app.quit();
     } catch (e2) {
       console.error('Direct installer execution failed:', e2);
     }
@@ -316,6 +435,7 @@ let startWithWindows = false; // Persisted to config.json; used to reliably trac
 
 let extensionVersion = '1.0.8'; // Fallback
 let lastSeenExtensionVersion = '';
+let lastExportedExtensionDir = '';
 
 function loadExtensionVersion() {
   try {
@@ -337,6 +457,89 @@ function loadExtensionVersion() {
   }
 }
 
+function readManifestVersionFromDir(dirPath) {
+  try {
+    if (!dirPath) return null;
+    const manifestFile = path.join(dirPath, 'manifest.json');
+    if (!fs.existsSync(manifestFile)) return null;
+    const data = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    if (data && data.version && (!data.name || String(data.name).toLowerCase().includes('idm lite'))) {
+      return { version: String(data.version).trim(), path: dirPath };
+    }
+  } catch {
+    // Ignore invalid manifest
+  }
+  return null;
+}
+
+function detectInstalledExtensionOnDisk() {
+  try {
+    if (lastExportedExtensionDir) {
+      const saved = readManifestVersionFromDir(lastExportedExtensionDir);
+      if (saved) return saved;
+    }
+
+    const localAppData = process.env.LOCALAPPDATA || '';
+    if (localAppData) {
+      const browserUserDataRoots = [
+        path.join(localAppData, 'Google', 'Chrome', 'User Data'),
+        path.join(localAppData, 'Microsoft', 'Edge', 'User Data'),
+        path.join(localAppData, 'CocCoc', 'Browser', 'User Data'),
+        path.join(localAppData, 'BraveSoftware', 'Brave-Browser', 'User Data')
+      ];
+      const profileNames = ['Default', 'Profile 1', 'Profile 2', 'Profile 3', 'Profile 4', 'Profile 5'];
+      for (const root of browserUserDataRoots) {
+        if (!fs.existsSync(root)) continue;
+        for (const prof of profileNames) {
+          const prefsPath = path.join(root, prof, 'Preferences');
+          if (!fs.existsSync(prefsPath)) continue;
+          try {
+            const raw = fs.readFileSync(prefsPath, 'utf8');
+            if (!raw.includes('IDM Lite')) continue;
+            const prefs = JSON.parse(raw);
+            const settings = prefs?.extensions?.settings;
+            if (!settings || typeof settings !== 'object') continue;
+            for (const extEntry of Object.values(settings)) {
+              if (!extEntry || !extEntry.path) continue;
+              const extName = String(extEntry.manifest?.name || '').toLowerCase();
+              if (!extName.includes('idm lite')) continue;
+              const resolved = readManifestVersionFromDir(extEntry.path);
+              if (resolved) return resolved;
+            }
+          } catch {
+            // Ignore unreadable profile Preferences
+          }
+        }
+      }
+    }
+
+    const fallbackDirs = [
+      path.join(path.dirname(app.getPath('exe')), '..', 'idmlite-extension'),
+      'D:\\Program Files\\idmlite-extension',
+      'C:\\Program Files\\idmlite-extension'
+    ];
+    for (const dir of fallbackDirs) {
+      const resolved = readManifestVersionFromDir(dir);
+      if (resolved) return resolved;
+    }
+  } catch {
+    // Ignore disk scan failure
+  }
+  return null;
+}
+
+function buildExtensionStatus() {
+  const onDisk = detectInstalledExtensionOnDisk();
+  const installedVer = lastSeenExtensionVersion || (onDisk ? onDisk.version : '');
+  const needsUpdate = Boolean(installedVer && installedVer !== extensionVersion);
+  return {
+    bundledVersion: extensionVersion,
+    installedVersion: installedVer || 'Chưa nhận diện',
+    detectedPath: onDisk ? onDisk.path : (lastExportedExtensionDir || ''),
+    needsUpdate
+  };
+}
+
 const configPath = path.join(app.getPath('userData'), 'config.json');
 
 function loadConfig() {
@@ -346,6 +549,9 @@ function loadConfig() {
       if (data.extensions) interceptedExtensions = data.extensions;
       if (data.isInterceptionEnabled !== undefined) isInterceptionEnabled = data.isInterceptionEnabled;
       if (data.startWithWindows !== undefined) startWithWindows = data.startWithWindows;
+      if (typeof data.lastExportedExtensionDir === 'string') {
+        lastExportedExtensionDir = data.lastExportedExtensionDir;
+      }
       console.log('IDM Lite config loaded successfully.');
     }
   } catch (e) {
@@ -374,7 +580,8 @@ function saveConfig() {
     fs.writeFileSync(configPath, JSON.stringify({
       extensions: interceptedExtensions,
       isInterceptionEnabled: isInterceptionEnabled,
-      startWithWindows: startWithWindows
+      startWithWindows: startWithWindows,
+      lastExportedExtensionDir: lastExportedExtensionDir
     }, null, 2));
     console.log('IDM Lite config saved.');
   } catch (e) {
@@ -417,6 +624,12 @@ function createWindow() {
     if (!isHidden) {
       mainWindow.show();
     }
+    // Check extension version mismatch shortly after startup
+    setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('extension-status-update', buildExtensionStatus());
+      }
+    }, 1500);
     // Check for updates 5s after window is ready (non-blocking)
     setTimeout(checkForUpdates, 5000);
     // Re-check every 30 minutes while app is running
@@ -524,6 +737,8 @@ function openPromptWindow(urlOrData, fileName, cookies, referrer, userAgent) {
     ? {
       url: urlOrData.url || '',
       pageUrl: urlOrData.pageUrl || '',
+      backupUrls: Array.isArray(urlOrData.backupUrls) ? urlOrData.backupUrls : [],
+      customHeaders: (urlOrData.customHeaders && typeof urlOrData.customHeaders === 'object') ? urlOrData.customHeaders : {},
       fileName: urlOrData.fileName || '',
       title: urlOrData.title || '',
       cookies: urlOrData.cookies || '',
@@ -537,6 +752,8 @@ function openPromptWindow(urlOrData, fileName, cookies, referrer, userAgent) {
     : {
       url: urlOrData || '',
       pageUrl: '',
+      backupUrls: [],
+      customHeaders: {},
       fileName: fileName || '',
       title: '',
       cookies: cookies || '',
@@ -806,6 +1023,8 @@ function startHttpServer() {
               openPromptWindow({
                 url: downloadUrl,
                 pageUrl: data.pageUrl || '',
+                backupUrls: Array.isArray(data.backupUrls) ? data.backupUrls : [],
+                customHeaders: (data.customHeaders && typeof data.customHeaders === 'object') ? data.customHeaders : {},
                 fileName,
                 title: data.title || '',
                 cookies: data.cookies || '',
@@ -851,25 +1070,11 @@ function startHttpServer() {
         const oldVersion = lastSeenExtensionVersion;
         lastSeenExtensionVersion = extVer;
 
-        if (oldVersion !== extVer && mainWindow && !mainWindow.isDestroyed()) {
-          const parsedBundled = extensionVersion.split('.').map(Number);
-          const parsedLastSeen = extVer.split('.').map(Number);
-          let needsUpdate = false;
-          for (let i = 0; i < Math.max(parsedBundled.length, parsedLastSeen.length); i++) {
-            const b = parsedBundled[i] || 0;
-            const l = parsedLastSeen[i] || 0;
-            if (b > l) {
-              needsUpdate = true;
-              break;
-            } else if (l > b) {
-              break;
-            }
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          const status = buildExtensionStatus();
+          if (oldVersion !== extVer || status.needsUpdate) {
+            mainWindow.webContents.send('extension-status-update', status);
           }
-          mainWindow.webContents.send('extension-status-update', {
-            bundledVersion: extensionVersion,
-            installedVersion: extVer,
-            needsUpdate
-          });
         }
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1038,11 +1243,13 @@ function isVideoPlatformUrl(urlStr) {
 
 let cachedFfmpegPath = undefined;
 function findFfmpegPath() {
-  if (cachedFfmpegPath !== undefined) return cachedFfmpegPath;
+  if (cachedFfmpegPath && (cachedFfmpegPath === 'ffmpeg' || fs.existsSync(cachedFfmpegPath))) {
+    return cachedFfmpegPath;
+  }
   const binName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
   const localBin = path.join(app.getPath('userData'), 'bin', binName);
   try {
-    if (fs.existsSync(localBin)) {
+    if (fs.existsSync(localBin) && fs.statSync(localBin).size > 5 * 1024 * 1024) {
       cachedFfmpegPath = localBin;
       return cachedFfmpegPath;
     }
@@ -1057,6 +1264,35 @@ function findFfmpegPath() {
   } catch (e) {}
 
   cachedFfmpegPath = null;
+  return null;
+}
+
+let cachedJsRuntimeArg = undefined;
+function findJsRuntimeArg() {
+  if (cachedJsRuntimeArg !== undefined) return cachedJsRuntimeArg;
+
+  const candidates = [
+    { name: 'deno', bins: ['deno'] },
+    { name: 'node', bins: ['node', 'C:\\Program Files\\nodejs\\node.exe', 'D:\\Program Files\\Nodejs\\node.exe'] },
+    { name: 'bun', bins: ['bun'] }
+  ];
+
+  for (const rt of candidates) {
+    const localExe = path.join(app.getPath('userData'), 'bin', process.platform === 'win32' ? `${rt.name}.exe` : rt.name);
+    const pathsToTry = [localExe, ...rt.bins];
+    for (const binPath of pathsToTry) {
+      try {
+        if (binPath !== rt.name && !fs.existsSync(binPath)) continue;
+        const res = spawnSync(binPath, ['--version'], { windowsHide: true, timeout: 3000 });
+        if (res && res.status === 0) {
+          cachedJsRuntimeArg = binPath === rt.name ? rt.name : `${rt.name}:${binPath}`;
+          return cachedJsRuntimeArg;
+        }
+      } catch (e) {}
+    }
+  }
+
+  cachedJsRuntimeArg = null;
   return null;
 }
 
@@ -1079,43 +1315,27 @@ function findExistingYtDlpPath() {
   return null;
 }
 
-let ytDlpInstallPromise = null;
-function ensureYtDlpBinary(onProgressNote) {
-  const existing = findExistingYtDlpPath();
-  if (existing) return Promise.resolve(existing);
-
-  if (ytDlpInstallPromise) {
-    return ytDlpInstallPromise;
-  }
-
-  const binDir = path.join(app.getPath('userData'), 'bin');
-  const binName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
-  const destPath = path.join(binDir, binName);
+function downloadBinaryFile(downloadUrl, destPath, label, onProgressNote) {
+  const binDir = path.dirname(destPath);
   const tempPath = destPath + '.part';
-  const downloadUrl = process.platform === 'win32'
-    ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
-    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
 
-  ytDlpInstallPromise = new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     try {
       if (!fs.existsSync(binDir)) {
         fs.mkdirSync(binDir, { recursive: true });
       }
     } catch (err) {
-      ytDlpInstallPromise = null;
       return reject(err);
     }
 
     const follow = (curUrl, redirects = 0) => {
       if (redirects > 8) {
-        ytDlpInstallPromise = null;
-        return reject(new Error('Chuyển hướng quá nhiều lần khi tải công cụ yt-dlp.'));
+        return reject(new Error(`Chuyển hướng quá nhiều lần khi tải ${label}.`));
       }
       let parsed;
       try {
         parsed = new URL(curUrl);
       } catch (err) {
-        ytDlpInstallPromise = null;
         return reject(err);
       }
       const client = parsed.protocol === 'https:' ? https : http;
@@ -1130,8 +1350,7 @@ function ensureYtDlpBinary(onProgressNote) {
         }
 
         if (res.statusCode !== 200) {
-          ytDlpInstallPromise = null;
-          return reject(new Error(`Không thể tải công cụ video (HTTP ${res.statusCode})`));
+          return reject(new Error(`Không thể tải ${label} (HTTP ${res.statusCode})`));
         }
 
         const total = parseInt(res.headers['content-length'] || '0', 10);
@@ -1142,7 +1361,7 @@ function ensureYtDlpBinary(onProgressNote) {
           transferred += chunk.length;
           if (onProgressNote && total > 0) {
             const pct = Math.min(99, Math.round((transferred / total) * 100));
-            onProgressNote(`Đang khởi tạo công cụ video (${pct}%)...`);
+            onProgressNote(`Đang khởi tạo ${label} (${pct}%)...`);
           }
         });
 
@@ -1156,24 +1375,20 @@ function ensureYtDlpBinary(onProgressNote) {
               if (process.platform !== 'win32') {
                 fs.chmodSync(destPath, 0o755);
               }
-              ytDlpInstallPromise = null;
               resolve(destPath);
             } catch (err) {
-              ytDlpInstallPromise = null;
               reject(err);
             }
           });
         });
 
         out.on('error', (err) => {
-          ytDlpInstallPromise = null;
           try { fs.unlinkSync(tempPath); } catch (e) {}
           reject(err);
         });
       });
 
       req.on('error', (err) => {
-        ytDlpInstallPromise = null;
         try { fs.unlinkSync(tempPath); } catch (e) {}
         reject(err);
       });
@@ -1181,8 +1396,60 @@ function ensureYtDlpBinary(onProgressNote) {
 
     follow(downloadUrl);
   });
+}
+
+let ytDlpInstallPromise = null;
+function ensureYtDlpBinary(onProgressNote) {
+  const existing = findExistingYtDlpPath();
+  if (existing) return Promise.resolve(existing);
+
+  if (ytDlpInstallPromise) {
+    return ytDlpInstallPromise;
+  }
+
+  const binDir = path.join(app.getPath('userData'), 'bin');
+  const binName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+  const destPath = path.join(binDir, binName);
+  const downloadUrl = process.platform === 'win32'
+    ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+
+  ytDlpInstallPromise = downloadBinaryFile(downloadUrl, destPath, 'công cụ video', onProgressNote)
+    .finally(() => {
+      ytDlpInstallPromise = null;
+    });
 
   return ytDlpInstallPromise;
+}
+
+let ffmpegInstallPromise = null;
+function ensureFfmpegBinary(onProgressNote) {
+  const existing = findFfmpegPath();
+  if (existing) return Promise.resolve(existing);
+
+  if (ffmpegInstallPromise) {
+    return ffmpegInstallPromise;
+  }
+
+  const binDir = path.join(app.getPath('userData'), 'bin');
+  const binName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  const destPath = path.join(binDir, binName);
+  const downloadUrl = process.platform === 'win32'
+    ? 'https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-win32-x64'
+    : (process.platform === 'darwin'
+      ? 'https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64'
+      : 'https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64');
+
+  ffmpegInstallPromise = downloadBinaryFile(downloadUrl, destPath, 'bộ ghép video ffmpeg', onProgressNote)
+    .then((savedPath) => {
+      cachedFfmpegPath = savedPath;
+      return savedPath;
+    })
+    .finally(() => {
+      ffmpegInstallPromise = null;
+    });
+
+  return ffmpegInstallPromise;
 }
 
 function writeNetscapeCookiesFile(cookieFilePath, cookieList, cookieStr, targetUrl) {
@@ -1303,12 +1570,148 @@ function fetchHtmlText(targetUrl, cookies, referrer, userAgent, redirectCount = 
   });
 }
 
+function decodeBaseN(token, radix) {
+  const digits = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let value = 0;
+  for (let i = 0; i < token.length; i++) {
+    const idx = digits.indexOf(token[i]);
+    if (idx === -1 || idx >= radix) return NaN;
+    value = value * radix + idx;
+  }
+  return value;
+}
+
+function readJsStringLiteral(sourceText, quoteIdx) {
+  const quote = sourceText[quoteIdx];
+  if (quote !== '\'' && quote !== '"') return null;
+  let out = '';
+  for (let i = quoteIdx + 1; i < sourceText.length; i++) {
+    const ch = sourceText[i];
+    if (ch === '\\') {
+      if (i + 1 >= sourceText.length) return null;
+      const next = sourceText[++i];
+      if (next === 'n') out += '\n';
+      else if (next === 'r') out += '\r';
+      else if (next === 't') out += '\t';
+      else if (next === 'x' && i + 2 < sourceText.length) {
+        const code = parseInt(sourceText.slice(i + 1, i + 3), 16);
+        if (!Number.isNaN(code)) {
+          out += String.fromCharCode(code);
+          i += 2;
+        } else {
+          out += 'x';
+        }
+      } else if (next === 'u' && i + 4 < sourceText.length) {
+        const code = parseInt(sourceText.slice(i + 1, i + 5), 16);
+        if (!Number.isNaN(code)) {
+          out += String.fromCharCode(code);
+          i += 4;
+        } else {
+          out += 'u';
+        }
+      } else {
+        out += next;
+      }
+    } else if (ch === quote) {
+      return { value: out, endIndex: i };
+    } else {
+      out += ch;
+    }
+  }
+  return null;
+}
+
+function skipWhitespace(str, idx) {
+  let pos = idx;
+  while (pos < str.length && /\s/.test(str[pos])) pos++;
+  return pos;
+}
+
+function unpackDeanEdwardsBlocks(sourceText) {
+  if (!sourceText || typeof sourceText !== 'string' || !sourceText.includes('eval')) {
+    return [];
+  }
+  const results = [];
+  const headerRegex = /eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)/g;
+  let headerMatch;
+  while ((headerMatch = headerRegex.exec(sourceText)) !== null) {
+    try {
+      const searchStart = headerMatch.index + headerMatch[0].length;
+      const searchWindow = sourceText.slice(searchStart, searchStart + 600);
+      const splitOffset = searchWindow.indexOf('}(');
+      const altOffset = splitOffset !== -1 ? splitOffset : searchWindow.search(/\}\s*\(/);
+      if (altOffset === -1) continue;
+
+      let pos = searchStart + altOffset + 1;
+      pos = skipWhitespace(sourceText, pos);
+      if (sourceText[pos] !== '(') continue;
+      pos = skipWhitespace(sourceText, pos + 1);
+
+      const payloadLit = readJsStringLiteral(sourceText, pos);
+      if (!payloadLit) continue;
+
+      pos = skipWhitespace(sourceText, payloadLit.endIndex + 1);
+      if (sourceText[pos] !== ',') continue;
+      pos = skipWhitespace(sourceText, pos + 1);
+
+      const radixMatch = sourceText.slice(pos, pos + 16).match(/^(\d+)\s*,\s*(\d+)\s*,/);
+      if (!radixMatch) continue;
+      const radix = parseInt(radixMatch[1], 10);
+      const count = parseInt(radixMatch[2], 10);
+      if (!radix || radix < 2 || radix > 62 || !count) continue;
+
+      pos = skipWhitespace(sourceText, pos + radixMatch[0].length);
+      const dictLit = readJsStringLiteral(sourceText, pos);
+      if (!dictLit) continue;
+
+      const afterDict = sourceText.slice(dictLit.endIndex + 1, dictLit.endIndex + 32);
+      if (!/^\s*\.split\s*\(\s*(['"])\|\1\s*\)/.test(afterDict)) continue;
+
+      const dict = dictLit.value.split('|');
+      const unpacked = payloadLit.value.replace(/\b[0-9a-zA-Z]+\b/g, (tok) => {
+        const idx = decodeBaseN(tok, radix);
+        if (!Number.isNaN(idx) && idx >= 0 && idx < dict.length && dict[idx]) {
+          return dict[idx];
+        }
+        return tok;
+      });
+      results.push(unpacked);
+      headerRegex.lastIndex = dictLit.endIndex + 1;
+    } catch {
+      // Ignore malformed packed block
+    }
+  }
+  return results;
+}
+
 async function extractStaticStreamFromHtml(pageUrl, cookies, referrer, userAgent) {
   try {
     const { html, finalUrl } = await fetchHtmlText(pageUrl, cookies, referrer || pageUrl, userAgent);
     if (!html) return null;
 
     const normalizedHtml = html.replace(/\\\//g, '/');
+
+    // 0. Unpack Dean Edwards packed scripts (e.g. missav.ws surrit.com HLS URLs)
+    const unpackedBlocks = unpackDeanEdwardsBlocks(html);
+    if (unpackedBlocks.length > 0) {
+      const packedStreamRegex = /https?:\/\/[^\s"'<>\\`]+\.(?:m3u8|mpd)(?:\?[^\s"'<>\\`]*)?/gi;
+      let fallbackPacked = null;
+      for (const block of unpackedBlocks) {
+        const matches = block.match(packedStreamRegex);
+        if (!matches) continue;
+        for (const rawUrl of matches) {
+          const clean = rawUrl.replace(/&amp;/g, '&');
+          const vType = /\.mpd(\?|$)/i.test(clean) ? 'dash' : 'hls';
+          if (/(playlist|master|index)\.m3u8/i.test(clean)) {
+            return { url: clean, videoType: vType };
+          }
+          if (!fallbackPacked) {
+            fallbackPacked = { url: clean, videoType: vType };
+          }
+        }
+      }
+      if (fallbackPacked) return fallbackPacked;
+    }
 
     // 1. Check active episode attributes (e.g. data-sv-ep / data-episode on movie sites)
     let sv = '';
@@ -1473,6 +1876,9 @@ class DownloadTask {
     this.id = id;
     this.url = normalizeGoogleDriveUrl(url);
     this.pageUrl = options.pageUrl || '';
+    this.backupUrls = Array.isArray(options.backupUrls) ? options.backupUrls : [];
+    this.customHeaders = (options.customHeaders && typeof options.customHeaders === 'object') ? options.customHeaders : {};
+    this.triedBackupUrls = new Set();
     this.cookieList = Array.isArray(options.cookieList) ? options.cookieList : [];
     this.isVideo = Boolean(options.isVideo);
     this.videoType = options.videoType || 'auto';
@@ -1495,6 +1901,8 @@ class DownloadTask {
     this.request = null;
     this.childProcess = null;
     this.hlsAborted = false;
+    this.hlsUseNetFetch = false;
+    this.hlsNetProfile = null;
     this.triedWebpageFallback = false;
     this.segmentRequests = [];
     this.segmentStreams = [];
@@ -1532,7 +1940,10 @@ class DownloadTask {
     this.status = 'downloading';
     this.statusNote = '';
     this.hlsAborted = false;
+    this.hlsUseNetFetch = false;
+    this.hlsNetProfile = null;
     this.triedWebpageFallback = false;
+    this.triedBackupUrls = new Set();
     this.lastBytes = 0;
     this.startSpeedTracker();
 
@@ -2222,7 +2633,189 @@ class DownloadTask {
     this.complete();
   }
 
-  async fetchBuffer(targetUrl, extraHeaders = {}, redirectCount = 0) {
+  buildHlsNetHeaders(profile = 'origin-ref-clean', extraHeaders = {}) {
+    const reqHeaders = {
+      'User-Agent': this.userAgent || DEFAULT_USER_AGENT,
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9,vi;q=0.8'
+    };
+
+    const ref = this.referrer || this.pageUrl || '';
+    let origin = '';
+    if (ref && /^https?:\/\//i.test(ref)) {
+      try {
+        origin = new URL(ref).origin;
+      } catch {
+        origin = '';
+      }
+    }
+
+    if (profile === 'origin-ref-clean' || profile === 'origin-ref') {
+      if (origin) {
+        reqHeaders['Referer'] = `${origin}/`;
+        reqHeaders['Origin'] = origin;
+      } else if (ref) {
+        reqHeaders['Referer'] = ref;
+      }
+    } else if (profile === 'full-ref-cookies') {
+      if (ref) reqHeaders['Referer'] = ref;
+      if (origin) reqHeaders['Origin'] = origin;
+      if (this.cookies) reqHeaders['Cookie'] = this.cookies;
+    }
+
+    if (this.customHeaders && typeof this.customHeaders === 'object') {
+      const cleanCustom = sanitizeCustomHeaders(this.customHeaders);
+      const cdnOnly = profile === 'origin-ref-clean' || profile === 'no-ref-clean';
+      for (const [k, v] of Object.entries(cleanCustom)) {
+        if (cdnOnly && !k.toLowerCase().startsWith('x-cdn-')) continue;
+        reqHeaders[k] = v;
+      }
+    }
+    if (extraHeaders.range) reqHeaders['Range'] = extraHeaders.range;
+    return reqHeaders;
+  }
+
+  async fetchBufferViaNet(targetUrl, extraHeaders = {}, profile = null) {
+    if (this.hlsAborted || this.status !== 'downloading') {
+      throw new Error('Download aborted');
+    }
+
+    const reqHeaders = this.buildHlsNetHeaders(profile || this.hlsNetProfile || 'origin-ref-clean', extraHeaders);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let req;
+      try {
+        req = net.request({
+          method: 'GET',
+          url: targetUrl,
+          redirect: 'follow'
+        });
+      } catch (e) {
+        return reject(e);
+      }
+
+      if (typeof req.destroy !== 'function') {
+        req.destroy = () => {
+          try { req.abort(); } catch {}
+        };
+      }
+
+      for (const [k, v] of Object.entries(reqHeaders)) {
+        try {
+          req.setHeader(k, v);
+        } catch {
+          // Skip invalid header
+        }
+      }
+
+      const cleanupReq = () => {
+        this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
+      };
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanupReq();
+        try { req.abort(); } catch {}
+        reject(new Error('ETIMEDOUT: Chromium net.request timeout'));
+      }, 20000);
+
+      req.on('response', (res) => {
+        if (res.statusCode >= 400) {
+          clearTimeout(timer);
+          cleanupReq();
+          if (!settled) {
+            settled = true;
+            try { req.abort(); } catch {}
+            reject(new Error(`HTTP ${res.statusCode}`));
+          }
+          return;
+        }
+
+        const chunks = [];
+        res.on('data', (chunk) => {
+          if (this.hlsAborted || this.status !== 'downloading') {
+            clearTimeout(timer);
+            cleanupReq();
+            if (!settled) {
+              settled = true;
+              try { req.abort(); } catch {}
+              reject(new Error('Download aborted'));
+            }
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          clearTimeout(timer);
+          cleanupReq();
+          if (settled) return;
+          settled = true;
+          if (this.hlsAborted || this.status !== 'downloading') {
+            return reject(new Error('Download aborted'));
+          }
+          const ctHeader = res.headers && res.headers['content-type'];
+          const contentType = (Array.isArray(ctHeader) ? ctHeader[0] : (ctHeader || '')).toLowerCase();
+          resolve({
+            buffer: Buffer.concat(chunks),
+            finalUrl: targetUrl,
+            contentType
+          });
+        });
+        res.on('error', (err) => {
+          clearTimeout(timer);
+          cleanupReq();
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        });
+      });
+
+      req.on('error', (err) => {
+        clearTimeout(timer);
+        cleanupReq();
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      });
+
+      this.segmentRequests.push(req);
+      req.end();
+    });
+  }
+
+  async fetchBufferViaNetWithFallback(targetUrl, extraHeaders = {}) {
+    const baseProfiles = ['origin-ref-clean', 'origin-ref', 'full-ref-cookies', 'no-ref-clean'];
+    const profiles = this.hlsNetProfile
+      ? [this.hlsNetProfile, ...baseProfiles.filter((p) => p !== this.hlsNetProfile)]
+      : baseProfiles;
+
+    let lastErr = null;
+    for (const prof of profiles) {
+      if (this.hlsAborted || this.status !== 'downloading') {
+        throw new Error('Download aborted');
+      }
+      try {
+        const res = await this.fetchBufferViaNet(targetUrl, extraHeaders, prof);
+        this.hlsUseNetFetch = true;
+        this.hlsNetProfile = prof;
+        return res;
+      } catch (err) {
+        lastErr = err;
+        const msg = err && err.message ? String(err.message) : '';
+        if (!/^HTTP (403|401)\b/i.test(msg)) {
+          throw err;
+        }
+        console.warn(`[HLS] Chromium net.request profile "${prof}" got ${msg} for ${targetUrl}`);
+      }
+    }
+    throw lastErr || new Error('HTTP 403');
+  }
+
+  async fetchBuffer(targetUrl, extraHeaders = {}, redirectCount = 0, forcedIp = null) {
     if (this.hlsAborted || this.status !== 'downloading') {
       throw new Error('Download aborted');
     }
@@ -2230,80 +2823,176 @@ class DownloadTask {
       throw new Error('Chuyển hướng quá nhiều lần khi tải luồng HLS.');
     }
 
-    return new Promise((resolve, reject) => {
-      let parsed;
-      try {
-        parsed = new URL(targetUrl);
-      } catch (e) {
-        return reject(e);
-      }
+    if (this.hlsUseNetFetch && !forcedIp) {
+      return this.fetchBufferViaNetWithFallback(targetUrl, extraHeaders);
+    }
 
-      const isHttps = parsed.protocol === 'https:';
-      const client = isHttps ? https : http;
-      const agent = isHttps ? httpsAgent : httpAgent;
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch (e) {
+      throw e;
+    }
 
-      const headers = buildStandardHeaders({
-        range: extraHeaders.range,
-        cookies: this.cookies,
-        referrer: this.referrer || this.pageUrl,
-        userAgent: this.userAgent
-      });
-      if (!extraHeaders.range) {
-        delete headers['Range'];
-      }
+    const cachedIp = !forcedIp ? workingHostIpCache.get(parsed.hostname) : null;
+    const effectiveIp = forcedIp || cachedIp || null;
 
-      const req = client.get(targetUrl, { agent, headers }, (res) => {
-        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-          this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
-          let nextUrl = res.headers.location;
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const isHttps = parsed.protocol === 'https:';
+        const client = isHttps ? https : http;
+        const agent = isHttps ? httpsAgent : httpAgent;
+
+        const headers = buildStandardHeaders({
+          range: extraHeaders.range,
+          cookies: this.cookies,
+          referrer: this.referrer || this.pageUrl,
+          userAgent: this.userAgent,
+          customHeaders: this.customHeaders
+        });
+        headers['Accept'] = '*/*';
+        headers['Sec-Fetch-Dest'] = 'empty';
+        headers['Sec-Fetch-Mode'] = 'cors';
+        headers['Sec-Fetch-Site'] = 'cross-site';
+        delete headers['Sec-Fetch-User'];
+        delete headers['Upgrade-Insecure-Requests'];
+        if (!extraHeaders.range) {
+          delete headers['Range'];
+        }
+        if (!headers['Origin'] && !headers['origin']) {
           try {
-            nextUrl = new URL(nextUrl, targetUrl).href;
-          } catch (e) {}
-          res.resume();
-          this.fetchBuffer(nextUrl, extraHeaders, redirectCount + 1).then(resolve, reject);
-          return;
+            const refForOrigin = this.referrer || this.pageUrl;
+            if (refForOrigin && /^https?:\/\//i.test(refForOrigin)) {
+              headers['Origin'] = new URL(refForOrigin).origin;
+            }
+          } catch {
+            // Ignore invalid referrer URL
+          }
         }
 
-        if (res.statusCode >= 400) {
-          this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
-          res.resume();
-          return reject(new Error(`HTTP ${res.statusCode}`));
+        const reqOptions = {
+          agent: effectiveIp ? false : agent,
+          headers,
+          timeout: 12000
+        };
+        if (effectiveIp) {
+          reqOptions.lookup = (_hostname, opts, cb) => {
+            if (typeof opts === 'function') {
+              return opts(null, effectiveIp, 4);
+            }
+            if (opts && opts.all) {
+              return cb(null, [{ address: effectiveIp, family: 4 }]);
+            }
+            return cb(null, effectiveIp, 4);
+          };
+          if (isHttps) {
+            reqOptions.servername = parsed.hostname;
+          }
         }
 
-        const chunks = [];
-        res.on('data', (chunk) => {
-          if (this.hlsAborted || this.status !== 'downloading') {
-            req.destroy();
+        const req = client.get(targetUrl, reqOptions, (res) => {
+          if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+            this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
+            let nextUrl = res.headers.location;
+            try {
+              nextUrl = new URL(nextUrl, targetUrl).href;
+            } catch (e) {}
+            res.resume();
+            this.fetchBuffer(nextUrl, extraHeaders, redirectCount + 1).then(resolve, reject);
             return;
           }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
-          if (this.hlsAborted || this.status !== 'downloading') {
-            return reject(new Error('Download aborted'));
+
+          if (res.statusCode >= 400) {
+            this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
+            res.resume();
+            return reject(new Error(`HTTP ${res.statusCode}`));
           }
-          resolve({
-            buffer: Buffer.concat(chunks),
-            finalUrl: targetUrl,
-            contentType: (res.headers['content-type'] || '').toLowerCase()
+
+          const chunks = [];
+          res.on('data', (chunk) => {
+            if (this.hlsAborted || this.status !== 'downloading') {
+              req.destroy();
+              return;
+            }
+            chunks.push(chunk);
+          });
+          res.on('end', () => {
+            this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
+            if (this.hlsAborted || this.status !== 'downloading') {
+              return reject(new Error('Download aborted'));
+            }
+            resolve({
+              buffer: Buffer.concat(chunks),
+              finalUrl: targetUrl,
+              contentType: (res.headers['content-type'] || '').toLowerCase()
+            });
+          });
+          res.on('error', (err) => {
+            this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
+            reject(err);
           });
         });
-        res.on('error', (err) => {
+
+        this.segmentRequests.push(req);
+        req.setTimeout(12000, () => {
+          req.destroy(new Error(`ETIMEDOUT: HLS request timeout${effectiveIp ? ` (${effectiveIp})` : ''}`));
+        });
+        req.on('error', (err) => {
           this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
           reject(err);
         });
       });
 
-      this.segmentRequests.push(req);
-      req.setTimeout(25000, () => {
-        req.destroy(new Error('HLS request timeout'));
-      });
-      req.on('error', (err) => {
-        this.segmentRequests = this.segmentRequests.filter((r) => r !== req);
-        reject(err);
-      });
-    });
+      if (effectiveIp && parsed.hostname) {
+        workingHostIpCache.set(parsed.hostname, effectiveIp);
+      }
+      return result;
+    } catch (err) {
+      if (this.hlsAborted || this.status !== 'downloading') {
+        throw err;
+      }
+      if (cachedIp && workingHostIpCache.get(parsed.hostname) === cachedIp) {
+        workingHostIpCache.delete(parsed.hostname);
+      }
+
+      const errCode = err && err.code ? String(err.code) : '';
+      const errMsg = err && err.message ? String(err.message) : '';
+
+      if (/^HTTP (403|401)\b/.test(errMsg) && !forcedIp) {
+        console.warn(`[HLS] Node fetch got ${errMsg}, retrying via Chromium net.fetch fallback profiles: ${targetUrl}`);
+        return this.fetchBufferViaNetWithFallback(targetUrl, extraHeaders);
+      }
+
+      const isNetworkIssue =
+        ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'EAI_AGAIN', 'EPIPE'].includes(errCode) ||
+        /ETIMEDOUT|timeout|ECONNRESET|EHOSTUNREACH|ECONNREFUSED/i.test(errMsg);
+
+      if (isNetworkIssue && !forcedIp) {
+        const failedIp = extractFailedIpFromError(err) || cachedIp;
+        try {
+          const altIps = (await resolveAlternateIps(parsed.hostname)).filter((ip) => ip !== failedIp).slice(0, 4);
+          for (const altIp of altIps) {
+            if (this.hlsAborted || this.status !== 'downloading') {
+              throw err;
+            }
+            console.warn(`[HLS] Retrying ${parsed.hostname} via alternate DNS IP ${altIp} (failed: ${failedIp || errCode || errMsg})`);
+            try {
+              const altRes = await this.fetchBuffer(targetUrl, extraHeaders, redirectCount, altIp);
+              workingHostIpCache.set(parsed.hostname, altIp);
+              return altRes;
+            } catch (altErr) {
+              console.warn(`[HLS] Alternate IP ${altIp} failed for ${parsed.hostname}: ${altErr.message}`);
+            }
+          }
+        } catch {
+          // Ignore DNS resolution failure and fall through to net.fetch
+        }
+
+        console.warn(`[HLS] Node fetch failed (${errCode || errMsg}), retrying via Chromium net.fetch: ${targetUrl}`);
+        return this.fetchBufferViaNetWithFallback(targetUrl, extraHeaders);
+      }
+      throw err;
+    }
   }
 
   parseM3u8Attributes(attrStr) {
@@ -2318,10 +3007,74 @@ class DownloadTask {
 
   async startHlsDownload(playlistUrl) {
     try {
+      this.triedBackupUrls.add(playlistUrl);
       this.statusNote = 'Đang phân tích danh sách phát HLS...';
       this.sendProgress(true);
 
-      const initialRes = await this.fetchBuffer(playlistUrl);
+      let initialRes = null;
+      let lastPlaylistErr = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        if (this.hlsAborted || this.status !== 'downloading') return;
+        try {
+          initialRes = await this.fetchBuffer(playlistUrl);
+          break;
+        } catch (err) {
+          lastPlaylistErr = err;
+          if (attempt < 2 && !this.hlsAborted && this.status === 'downloading') {
+            await new Promise((r) => setTimeout(r, 600));
+          }
+        }
+      }
+
+      if (!initialRes) {
+        // Failover 1: Try backup HLS mirror URLs captured from the same browser tab (never fall back to direct .mp4 ads)
+        for (const candidate of this.backupUrls) {
+          const candUrl = typeof candidate === 'string' ? candidate : candidate?.url;
+          const candType = typeof candidate === 'object' && candidate?.videoType ? candidate.videoType : 'auto';
+          if (!candUrl || !candUrl.startsWith('http') || this.triedBackupUrls.has(candUrl)) continue;
+          if (candType !== 'hls' && !/\.m3u8(\?|$|#)/i.test(candUrl)) continue;
+
+          this.triedBackupUrls.add(candUrl);
+          this.url = candUrl;
+          this.statusNote = 'CDN bị lỗi, đang chuyển sang máy chủ HLS dự phòng...';
+          this.sendProgress(true);
+          await this.startHlsDownload(candUrl);
+          return;
+        }
+
+        // Failover 2: Re-extract a live HLS stream from the page URL via hidden BrowserWindow/HTML
+        if (!this.triedWebpageFallback && this.pageUrl && this.pageUrl.startsWith('http')) {
+          this.triedWebpageFallback = true;
+          this.statusNote = 'Đang tìm luồng phát thay thế trên trang...';
+          this.sendProgress(true);
+          try {
+            const extracted = await extractStreamFromWebpage(
+              this.pageUrl,
+              this.cookies,
+              this.referrer || this.pageUrl,
+              this.userAgent,
+              this.cookieList
+            );
+            if (this.hlsAborted || this.status !== 'downloading') return;
+            if (
+              extracted &&
+              extracted.url &&
+              !this.triedBackupUrls.has(extracted.url) &&
+              (extracted.videoType === 'hls' || /\.m3u8(\?|$|#)/i.test(extracted.url))
+            ) {
+              this.triedBackupUrls.add(extracted.url);
+              this.url = extracted.url;
+              this.videoType = 'hls';
+              this.statusNote = '';
+              await this.startHlsDownload(extracted.url);
+              return;
+            }
+          } catch (e) {}
+        }
+
+        throw lastPlaylistErr || new Error('Không thể kết nối tới máy chủ phát video.');
+      }
+
       let mediaPlaylistUrl = initialRes.finalUrl;
       let playlistText = initialRes.buffer.toString('utf8');
 
@@ -2523,7 +3276,7 @@ class DownloadTask {
                 outBuf = Buffer.concat([decipher.update(outBuf), decipher.final()]);
               }
               outBuf = stripDisguisedTsHeader(outBuf);
-              fs.writeFileSync(segPath, outBuf);
+              await fs.promises.writeFile(segPath, outBuf);
               this.downloaded += outBuf.length;
               segSuccess = true;
               break;
@@ -2610,23 +3363,49 @@ class DownloadTask {
       });
 
       if (shouldRemux) {
-        let remux = spawnSync(ffmpegPath, ['-y', '-i', concatDestPath, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', this.filePath], { windowsHide: true });
-        if (!remux || remux.status !== 0) {
-          remux = spawnSync(ffmpegPath, ['-y', '-i', concatDestPath, '-c', 'copy', this.filePath], { windowsHide: true });
+        this.statusNote = 'Đang đóng gói video sang MP4...';
+        this.sendProgress(true);
+
+        const runFfmpegAsync = (args) =>
+          new Promise((resolve) => {
+            try {
+              const proc = spawn(ffmpegPath, args, { windowsHide: true, stdio: 'ignore' });
+              this.childProcess = proc;
+              proc.on('close', (code) => {
+                if (this.childProcess === proc) this.childProcess = null;
+                resolve(code === 0);
+              });
+              proc.on('error', () => {
+                if (this.childProcess === proc) this.childProcess = null;
+                resolve(false);
+              });
+            } catch {
+              this.childProcess = null;
+              resolve(false);
+            }
+          });
+
+        let ok = await runFfmpegAsync(['-y', '-i', concatDestPath, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', this.filePath]);
+        if (this.hlsAborted) return;
+        if (!ok) {
+          ok = await runFfmpegAsync(['-y', '-i', concatDestPath, '-c', 'copy', this.filePath]);
+          if (this.hlsAborted) return;
         }
-        if (!remux || remux.status !== 0) {
-          fs.copyFileSync(concatDestPath, this.filePath);
+        if (!ok) {
+          await fs.promises.copyFile(concatDestPath, this.filePath);
         }
       }
 
       try {
-        if (fs.existsSync(this.filePath)) {
-          this.total = fs.statSync(this.filePath).size;
+        const stat = await fs.promises.stat(this.filePath).catch(() => null);
+        if (stat) {
+          this.total = stat.size;
           this.downloaded = this.total;
         }
       } catch (e) {}
 
-      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) {}
+      await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      if (this.hlsAborted) return;
       this.statusNote = '';
       this.complete();
     } catch (err) {
@@ -2636,10 +3415,12 @@ class DownloadTask {
     }
   }
 
-  async startYtDlpDownload(targetUrl) {
+  async startYtDlpDownload(targetUrl, retryOpts = {}) {
     try {
+      const { skipCookies = false, useAnyFormat = false, skipStatic = false } = retryOpts;
+
       // For general movie/streaming websites, try static HTML stream extraction first (fast, no yt-dlp needed)
-      if (!isVideoPlatformUrl(targetUrl) && this.videoType !== 'dash' && !this.triedWebpageFallback) {
+      if (!skipStatic && !isVideoPlatformUrl(targetUrl) && this.videoType !== 'dash' && !this.triedWebpageFallback) {
         this.statusNote = 'Đang kiểm tra luồng video trên trang...';
         this.sendProgress(true);
         const staticStream = await extractStaticStreamFromHtml(
@@ -2675,6 +3456,18 @@ class DownloadTask {
 
       if (this.hlsAborted || this.status !== 'downloading') return;
 
+      let ffmpegPath = findFfmpegPath();
+      if (!ffmpegPath) {
+        ffmpegPath = await ensureFfmpegBinary((note) => {
+          if (this.status === 'downloading') {
+            this.statusNote = note;
+            this.sendProgress();
+          }
+        }).catch(() => null);
+      }
+
+      if (this.hlsAborted || this.status !== 'downloading') return;
+
       this.downloaded = 0;
       this.total = 0;
       this.statusNote = 'Đang phân tích liên kết video...';
@@ -2685,32 +3478,36 @@ class DownloadTask {
         fs.mkdirSync(tempDir, { recursive: true });
       }
       const cookieFilePath = path.join(tempDir, 'cookies.txt');
-      const hasCookiesFile = writeNetscapeCookiesFile(cookieFilePath, this.cookieList, this.cookies, targetUrl);
-      const ffmpegPath = findFfmpegPath();
+      const hasCookiesFile = !skipCookies && writeNetscapeCookiesFile(cookieFilePath, this.cookieList, this.cookies, targetUrl);
+      const jsRuntimeArg = findJsRuntimeArg();
 
       const quality = this.quality || 'best';
       let formatArgs = [];
-      if (quality === 'audio') {
+      if (useAnyFormat) {
+        formatArgs = ffmpegPath
+          ? ['-f', 'bv*+ba/b/best', '--merge-output-format', 'mp4']
+          : ['-f', 'best'];
+      } else if (quality === 'audio') {
         const audioExt = this.fileName.toLowerCase().endsWith('.mp3') ? 'mp3' : 'm4a';
         formatArgs = ffmpegPath
           ? ['-f', 'bestaudio/best', '-x', '--audio-format', audioExt]
           : ['-f', 'bestaudio[ext=m4a]/bestaudio/best'];
       } else if (quality === '720p') {
         formatArgs = ffmpegPath
-          ? ['-f', 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/b', '--merge-output-format', 'mp4']
-          : ['-f', 'b[height<=720][ext=mp4]/b[height<=720]/b'];
+          ? ['-f', 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/b/best', '--merge-output-format', 'mp4']
+          : ['-f', 'b[height<=720][ext=mp4]/b[height<=720]/b/best'];
       } else if (quality === '480p') {
         formatArgs = ffmpegPath
-          ? ['-f', 'bv*[height<=480][ext=mp4]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]/b', '--merge-output-format', 'mp4']
-          : ['-f', 'b[height<=480][ext=mp4]/b[height<=480]/b'];
+          ? ['-f', 'bv*[height<=480][ext=mp4]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]/b/best', '--merge-output-format', 'mp4']
+          : ['-f', 'b[height<=480][ext=mp4]/b[height<=480]/b/best'];
       } else if (quality === '1080p') {
         formatArgs = ffmpegPath
-          ? ['-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b', '--merge-output-format', 'mp4']
-          : ['-f', 'b[height<=1080][ext=mp4]/b[height<=1080]/b'];
+          ? ['-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b/best', '--merge-output-format', 'mp4']
+          : ['-f', 'b[height<=1080][ext=mp4]/b[height<=1080]/b/best'];
       } else {
         formatArgs = ffmpegPath
-          ? ['-f', 'bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b', '--merge-output-format', 'mp4']
-          : ['-f', 'b[ext=mp4]/b'];
+          ? ['-f', 'bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b/best', '--merge-output-format', 'mp4']
+          : ['-f', 'b[ext=mp4]/b/bv*[ext=mp4]/bv*/ba/best'];
       }
 
       const isGenericName = /^(download_file_|untitled_|video_\d+)/i.test(this.fileName);
@@ -2733,6 +3530,9 @@ class DownloadTask {
         ...formatArgs
       ];
 
+      if (jsRuntimeArg) {
+        args.push('--js-runtimes', jsRuntimeArg);
+      }
       if (ffmpegPath && ffmpegPath !== 'ffmpeg') {
         args.push('--ffmpeg-location', path.dirname(ffmpegPath));
       }
@@ -2755,7 +3555,14 @@ class DownloadTask {
         completed: false
       }));
 
-      const child = spawn(ytDlpBin, args, { windowsHide: true });
+      const child = spawn(ytDlpBin, args, {
+        windowsHide: true,
+        env: {
+          ...process.env,
+          PYTHONUTF8: '1',
+          PYTHONIOENCODING: 'utf-8'
+        }
+      });
       this.childProcess = child;
 
       let stdoutBuf = '';
@@ -2827,14 +3634,14 @@ class DownloadTask {
       };
 
       child.stdout.on('data', (data) => {
-        stdoutBuf += data.toString();
+        stdoutBuf += data.toString('utf8');
         const lines = stdoutBuf.split(/\r?\n/);
         stdoutBuf = lines.pop() || '';
         lines.forEach(handleLine);
       });
 
       child.stderr.on('data', (data) => {
-        const text = data.toString().trim();
+        const text = data.toString('utf8').trim();
         if (text) {
           const lines = text.split(/\r?\n/).filter(Boolean);
           if (lines.length > 0) {
@@ -2872,6 +3679,18 @@ class DownloadTask {
           this.complete();
         } else {
           const cleanErr = lastStderr.replace(/^ERROR:\s*/i, '').trim();
+          if (/requested format is not available/i.test(lastStderr)) {
+            if (hasCookiesFile && !skipCookies) {
+              console.warn('[yt-dlp] Format unavailable with browser cookies. Retrying without cookies...');
+              this.startYtDlpDownload(targetUrl, { ...retryOpts, skipCookies: true, skipStatic: true });
+              return;
+            }
+            if (!useAnyFormat) {
+              console.warn('[yt-dlp] Requested format unavailable. Retrying with fallback format selector...');
+              this.startYtDlpDownload(targetUrl, { ...retryOpts, useAnyFormat: true, skipStatic: true });
+              return;
+            }
+          }
           if (!this.triedWebpageFallback && /unsupported url|no video formats|unable to extract/i.test(lastStderr)) {
             this.triedWebpageFallback = true;
             this.statusNote = 'Đang dò tìm luồng phát video trên trang...';
@@ -3040,7 +3859,7 @@ class DownloadTask {
 }
 
 // IPC listeners
-ipcMain.on('start-download', (event, { id, url, saveFolder, fileName, cookies, referrer, userAgent, pageUrl, cookieList, isVideo, videoType, quality }) => {
+ipcMain.on('start-download', (event, { id, url, saveFolder, fileName, cookies, referrer, userAgent, pageUrl, backupUrls, customHeaders, cookieList, isVideo, videoType, quality }) => {
   console.log(`Starting download: ${url} -> ${saveFolder}/${fileName}`);
 
   if (activeDownloads[id]) {
@@ -3049,6 +3868,8 @@ ipcMain.on('start-download', (event, { id, url, saveFolder, fileName, cookies, r
 
   const task = new DownloadTask(id, url, saveFolder, fileName, cookies, referrer, userAgent, {
     pageUrl,
+    backupUrls,
+    customHeaders,
     cookieList,
     isVideo,
     videoType,
@@ -3108,6 +3929,10 @@ ipcMain.on('confirm-prompt-download', (event, data) => {
     mainWindow.webContents.send('capture-download', {
       url: data.url,
       pageUrl: data.pageUrl !== undefined ? data.pageUrl : (fallback.pageUrl || ''),
+      backupUrls: Array.isArray(data.backupUrls) && data.backupUrls.length > 0 ? data.backupUrls : (fallback.backupUrls || []),
+      customHeaders: (data.customHeaders && typeof data.customHeaders === 'object' && Object.keys(data.customHeaders).length > 0)
+        ? data.customHeaders
+        : (fallback.customHeaders || {}),
       fileName: data.name,
       savePath: data.savePath,
       cookies: data.cookies !== undefined ? data.cookies : (fallback.cookies || ''),
@@ -3144,26 +3969,7 @@ ipcMain.handle('get-version', () => {
 });
 
 ipcMain.handle('get-extension-status', () => {
-  let needsUpdate = false;
-  if (lastSeenExtensionVersion) {
-    const parsedBundled = extensionVersion.split('.').map(Number);
-    const parsedLastSeen = lastSeenExtensionVersion.split('.').map(Number);
-    for (let i = 0; i < Math.max(parsedBundled.length, parsedLastSeen.length); i++) {
-      const b = parsedBundled[i] || 0;
-      const l = parsedLastSeen[i] || 0;
-      if (b > l) {
-        needsUpdate = true;
-        break;
-      } else if (l > b) {
-        break;
-      }
-    }
-  }
-  return {
-    bundledVersion: extensionVersion,
-    installedVersion: lastSeenExtensionVersion || 'Chưa nhận diện',
-    needsUpdate
-  };
+  return buildExtensionStatus();
 });
 
 ipcMain.handle('save-app-config', (event, newConfig) => {
@@ -3283,8 +4089,10 @@ ipcMain.handle('export-extension-folder', async () => {
     return { success: false, error: 'Không tìm thấy thư mục extension gốc.' };
   }
 
+  const detected = buildExtensionStatus();
   const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
     title: 'Chọn thư mục để lưu Extension',
+    defaultPath: lastExportedExtensionDir || detected.detectedPath || undefined,
     properties: ['openDirectory', 'createDirectory']
   });
 
@@ -3310,6 +4118,12 @@ ipcMain.handle('export-extension-folder', async () => {
     }
 
     fs.cpSync(extPath, targetDir, { recursive: true, force: true });
+    lastExportedExtensionDir = targetDir;
+    lastSeenExtensionVersion = '';
+    saveConfig();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('extension-status-update', buildExtensionStatus());
+    }
 
     shell.openPath(targetDir);
     return { success: true, path: targetDir };
